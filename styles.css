@@ -247,7 +247,6 @@ tr.type-row .type-select { max-width: none; margin-top: 0; }
 .tx-picker .type-select { max-width: none; }
 
 /* --- Sensitive documents (never sent to Claude) --- */
-.sensitive-toggle { margin-top: 10px; }
 .qstatus.manual { color: var(--warn); }
 .qactions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .btn.small.lock[aria-pressed="true"] { background: var(--warn); border-color: var(--warn); color: #fff; }
@@ -259,3 +258,32 @@ tr.type-row .type-select { max-width: none; margin-top: 0; }
 }
 .man-line input.amt { text-align: right; }
 .badge.manual { color: var(--warn); }
+
+/* --- Checking the other parent's entries --- */
+.other-check { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+.other-check h3 { font-size: .95rem; margin: 0 0 6px; }
+.vf-sum + .vf-sum { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.vf-row { display: flex; justify-content: space-between; gap: 10px; font-size: .9rem; padding: 2px 0; }
+.vf-row .count { margin-left: 6px; color: var(--muted); font-size: .8rem; }
+.vf-row.ok b { color: var(--ok); }
+.vf-row.warn b { color: var(--warn); }
+.vf-row.bad b, .vf-row.bad > span { color: var(--danger); }
+.other-check .hint.ok { color: var(--ok); }
+.vf-block { border-left: 4px solid var(--border); background: var(--bg); border-radius: 8px; padding: 8px 10px; margin: 8px 0; font-size: .88rem; }
+.vf-block.ok, .vf-block.accepted { border-left-color: var(--ok); }
+.vf-block.warn { border-left-color: var(--warn); }
+.vf-block.bad, .vf-block.disputed { border-left-color: var(--danger); }
+.vf-title { font-weight: 700; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.vf-head { margin-top: 2px; }
+.vf-head.ok { color: var(--ok); }
+.vf-head.warn { color: var(--warn); }
+.vf-issues { margin: 4px 0; padding-left: 18px; }
+.receipt .vf-issues li { margin: 2px 0; font-size: .86rem; }
+.receipt .vf-issues li.bad { color: var(--danger); }
+.receipt .vf-issues li.warn { color: var(--warn); margin-top: 2px; }
+.receipt .vf-issues li.info { color: var(--muted); list-style: circle; }
+.vf-block .type-select { margin-top: 4px; }
+.vf-block .actions { margin-top: 6px; }
+.chip-filter[hidden], .other-check[hidden] { display: none; }
+/* Sensitive file in the queue: its buttons go on their own row so the name and status keep the full width. */
+.queue li.wide-actions .qactions { grid-column: 1 / -1; }

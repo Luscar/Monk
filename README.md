@@ -43,9 +43,19 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 - **Full backup & restore** (Settings): one .zip with everything. Restoring on a new phone re-checks every fingerprint, merges without duplicates, and carries on with the ID numbering. The app reminds you when the last backup is more than 7 days old.
 - **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json`, `originals/` and `stamped/`, named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
 
+## Checking the other parent's expenses
+
+Everything marked *Paid by: Other parent* (their Excel/CSV grid and the photos/PDFs they send) gets a **Check (other parent)** box, a summary at the top of "Your receipts", and the *Other parent: to check* filter.
+
+- **Grid ↔ receipts**: each declared line is matched to one of their photos/PDFs (same amount within 7 days, or same store/description with another amount). A receipt can back up only one line. You can pick the supporting receipt yourself from the menu. The summary shows declared / backed by a receipt / amount higher than the receipt (excess) / no receipt.
+- **Flags on declared lines**: no receipt, declared amount ≠ receipt, receipt that also holds non-kids items, dates far apart, the same amount declared twice, the same receipt used for two lines, an expense that matches one of *your* receipts (you paid it), a date in the future, a supporting receipt that is itself suspicious.
+- **Their own (adult) expenses passed off as the children's**: lines Claude judged clearly for an adult (alcohol, tobacco, adult clothing…) or that you tagged *Not kids* are flagged, on a grid line itself or on the receipt behind it when the full amount is declared. The summary shows the adult amount to remove.
+- **Flags on their photos/PDFs** (computed on the phone, nothing extra sent): EXIF date of the photo *before* the purchase date, photo saved by an editing app (Photoshop, Snapseed, PicsArt…), the same photo sent again resized/cropped/recompressed (picture hash), the same receipt number used twice or also in your expenses, items + tax ≠ printed total, invoice without proof of payment, no date. Claude also reports concrete visible signs of alteration (digits in another font, overwritten amounts…) on new extractions.
+- Flags are leads, not proof. **Accept** or **Dispute** (with a reason) each entry; both are logged. The report, PDF, email summary and Excel (*Check (other parent)* column) include the totals and the problems found.
+
 ## Sensitive documents (never sent to Claude)
 
-Tick **🔒 Sensitive documents** under "Add receipts" before adding files, or tap the 🔒 button on a file in the queue. A sensitive file:
+Tap the 🔒 button on a file in the queue before extracting (nothing is sent until you tap *Extract with Claude*). A sensitive file:
 
 - stays on the device with its fingerprint, like every other original, but is **never sent to Claude** ("Extract with Claude" skips it, and the code refuses to build a Claude request for it);
 - gets a **✍️ Enter by hand** button: store, date, currency, payment method, lines (description + amount), tax, total, note. *Save & add another* handles a file holding several receipts, and "More… → Add another entry from this file" works later too;

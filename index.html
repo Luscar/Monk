@@ -60,10 +60,7 @@
         <button type="button" data-payer="other" data-i18n="payer.other">Other parent</button>
       </div>
       <p class="hint" data-i18n="add.payerHint"></p>
-      <label class="check sensitive-toggle">
-        <input id="sensitiveToggle" type="checkbox">
-        <span data-i18n-html="sens.toggle"></span>
-      </label>
+      <p class="hint" data-i18n-html="sens.toggle"></p>
       <p class="hint" data-i18n="add.hint"></p>
       <div id="dropZone" class="drop-zone" data-i18n="add.drop">…or drop files here</div>
       <ul id="queue" class="queue"></ul>
@@ -78,11 +75,14 @@
       <p class="hint" data-i18n-html="results.hint"></p>
       <div id="totals" class="totals"></div>
       <button id="applyAllBtn" class="btn small" hidden></button>
+      <div id="otherCheck" class="other-check" hidden></div>
       <div class="filters" role="tablist">
         <button class="chip-filter" data-filter="all" data-label-key="filter.all"></button>
         <button class="chip-filter" data-filter="untagged" data-label-key="filter.untagged"></button>
         <button class="chip-filter" data-filter="unverified" data-label-key="filter.unverified"></button>
         <button class="chip-filter" data-filter="dupe" data-label-key="filter.dupe"></button>
+        <button class="chip-filter" data-filter="tocheck" data-label-key="filter.tocheck" hidden></button>
+        <button class="chip-filter" data-filter="other" data-label-key="filter.other" hidden></button>
         <button class="chip-filter" data-filter="void" data-label-key="filter.void"></button>
       </div>
       <input id="search" class="search" type="search" data-i18n-ph="search.ph">

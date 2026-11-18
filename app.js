@@ -3,6 +3,7 @@ import { db } from "./db.js";
 import { makeZip, readZip } from "./zip.js";
 import { makeXlsx, readXlsx, readCsv, sheetsToText } from "./xlsx.js";
 import { t, lang, locale, regionCurrency, actionLabel, applyStatic } from "./i18n.js";
+import { readExif, dHash, hamming, EDITOR_RE } from "./imgcheck.js";
 
 // ---------------------------------------------------------------------------
 // Settings (small values in localStorage; files/receipts/log live in IndexedDB)
@@ -31,8 +32,6 @@ const settings = {
     }).filter((x) => x.name);
   },
   get intakePayer() { return store.get("intakePayer") === "other" ? "other" : "me"; },
-  /** New files are marked sensitive: kept on the device, never sent to Claude, entered by hand. */
-  get intakeSensitive() { return store.get("intakeSensitive") === "1"; },
   get kidsContext() { return store.get("kidsContext").trim(); },
   get splitDefault() {
     const raw = store.get("splitDefault").trim();
@@ -69,7 +68,7 @@ const RECEIPT_SCHEMA = {
         required: [
           "store_name", "store_address", "date", "time", "currency",
           "receipt_number", "payment_method", "items",
-          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type", "source_ref",
+          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type", "source_ref", "authenticity_concerns",
         ],
         properties: {
           store_name: { type: "string" },
@@ -103,6 +102,7 @@ const RECEIPT_SCHEMA = {
           tip: nullable("number"),
           total: nullable("number"),
           notes: { ...nullable("string"), description: "null unless something affects the amounts, date or legibility; then one short sentence (max ~20 words)" },
+          authenticity_concerns: { ...nullable("string"), description: "null unless there are concrete visible signs of alteration; then one short sentence" },
           document_type: {
             type: "string",
             enum: ["receipt", "invoice", "other"],
@@ -130,6 +130,7 @@ Rules:
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
 - expense_type is also only a suggestion: for items that are (or may be) for the children, pick the type from the user's list whose examples fit best; use "unknown" when unsure or when the item is not for the children.
 - Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12"). Skip headers, totals, subtotals and empty rows. Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
+- authenticity_concerns: null in the normal case. Only for photos/PDFs, and only when you see concrete signs that the document may have been altered or is not genuine: digits in a different font, size or alignment than the rest, amounts or dates that look overwritten or retouched, a total that matches no printed lines, a date inconsistent with other printed dates, a digitally composed receipt. Then ONE short factual sentence saying where. Never speculate; null for spreadsheets.
 - If the file contains no receipt at all, return an empty receipts array.`;
 
 const STATEMENT_SCHEMA = {
@@ -307,15 +308,37 @@ async function addFiles(fileList, { role = "receipt" } = {}) {
       receiptIds: [],
       payer: settings.intakePayer,
       role,
-      sensitive: settings.intakeSensitive,
+      sensitive: false, // the 🔒 button on the file in the queue marks it sensitive before extraction
     };
     if (rec.sensitive) rec.status = "manual";
+    if (kind === "image" && role !== "statement") rec.img = await imageInfo(file);
     files.push(rec);
     await saveFile(rec);
     await log("file_added", "", t("lg.fileAdded", { name: rec.name, size: rec.size, sha: sha256 })
       + (rec.sensitive ? ` · ${t("lg.sensitiveTag")}` : ""));
   }
   render();
+}
+
+/** EXIF + picture hash, computed on the device, used to check the other parent's photos. */
+async function imageInfo(blob) {
+  const [exif, hash] = await Promise.all([
+    readExif(blob).catch(() => null),
+    dHash(blob).catch(() => null),
+  ]);
+  return { exif, dhash: hash };
+}
+
+/** Photos added before these checks existed get their EXIF/hash once, in the background. */
+async function backfillImageInfo() {
+  let changed = false;
+  for (const f of files) {
+    if (f.kind !== "image" || f.role === "statement" || f.img || !f.blob) continue;
+    f.img = await imageInfo(f.blob);
+    await saveFile(f);
+    changed = true;
+  }
+  if (changed) render();
 }
 
 function readAsBase64(blob) {
@@ -640,6 +663,227 @@ function duplicateIds() {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Checking the other parent's claims (grid rows and the photos/PDFs they sent)
+// ---------------------------------------------------------------------------
+const dayNum = (d) => (d ? Date.parse(d) / 86_400_000 : NaN);
+const daysApart = (a, b) => Math.abs(dayNum(a) - dayNum(b));
+const sameMoney = (a, b) => Math.abs(a - b) < 0.011;
+const wordsOf = (str) => new Set(String(str || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  .split(/[^a-z0-9]+/).filter((w) => w.length > 2 && !/^\d+$/.test(w)));
+const textOf = (r) => `${r.store_name || ""} ${(r.items || []).map((i) => i.description).join(" ")}`;
+function similar(a, b) {
+  const A = wordsOf(textOf(a));
+  const B = wordsOf(textOf(b));
+  for (const w of A) if (B.has(w)) return true;
+  return false;
+}
+const today = () => new Date().toISOString().slice(0, 10);
+
+/** Items + tax that don't add up to the printed total. */
+function totalMismatch(r) {
+  const itemsSum = (r.items || []).reduce((s, it) => s + (it.line_total || 0), 0);
+  const expected = itemsSum + (r.tax || 0) + (r.tip || 0) - extraDiscount(r);
+  return r.total != null && Math.abs(expected - r.total) > 0.05 && Math.abs(itemsSum - r.total) > 0.05
+    ? { expected: round2(expected), printed: r.total } : null;
+}
+
+/**
+ * The adult part of an entry: lines you tagged "Not kids", or untagged lines Claude judged clearly for an
+ * adult (alcohol, adult clothing, tobacco…). Discount lines follow the line above. Includes the tax share.
+ */
+function adultPart(r) {
+  const a = allocation(r);
+  let amount = 0, prevAdult = false;
+  const names = [];
+  for (const it of a.items) {
+    const adult = it.alloc === "not" || (it.alloc === "review" && (it.linked ? prevAdult : it.ai_suggestion === "no"));
+    if (!it.linked) prevAdult = adult;
+    if (!adult) continue;
+    amount += (it.line_total || 0) * (a.factor || 1);
+    if (!it.linked && (it.line_total || 0) > 0) names.push(it.description);
+  }
+  const list = names.slice(0, 3).join(", ") + (names.length > 3 ? ` (+${names.length - 3})` : "");
+  return { amount: round2(Math.max(0, amount)), items: list };
+}
+
+/**
+ * For each active receipt paid by the other parent: what backs it up and what looks wrong.
+ * Declared grid rows are matched to the photos/PDFs the other parent supplied (same amount within a week,
+ * or same store/description with a different amount). Nothing here changes the receipts: it only reports.
+ * Returns Map(id → {kind: "declared"|"proof", match, auto, issues:[{level:"bad"|"warn"|"info", key, vars}], level}).
+ */
+function verifyOther() {
+  const active = receipts.filter((r) => !r.voided);
+  const other = active.filter((r) => r.payer === "other");
+  const mine = active.filter((r) => r.payer !== "other");
+  const declared = other.filter((r) => r.declared);
+  const proofs = other.filter((r) => !r.declared);
+  const res = new Map(other.map((r) => [r.id, { kind: r.declared ? "declared" : "proof", match: null, auto: false, issues: [] }]));
+  const add = (r, level, key, vars = {}) => res.get(r.id).issues.push({ level, key, vars });
+  const ids = (list) => list.map((x) => x.id).join(", ");
+
+  // 1. Match each declared row to a supporting document (manual links first, then best automatic pairs).
+  const used = new Map(); // proof id → declared id
+  for (const d of declared) {
+    const p = d.justifiedBy && getReceipt(d.justifiedBy);
+    if (p && !p.voided) { res.get(d.id).match = p.id; used.set(p.id, d.id); }
+  }
+  const pairs = [];
+  for (const d of declared) {
+    if (res.get(d.id).match) continue;
+    for (const p of proofs) {
+      if (curOf(p) !== curOf(d)) continue;
+      const amt = sameMoney(receiptTotal(d), receiptTotal(p)) || (isTagged(p) && sameMoney(receiptTotal(d), allocation(p).kids));
+      const dd = d.date && p.date ? daysApart(d.date, p.date) : 30;
+      const sim = similar(d, p);
+      let score = null;
+      if (amt && dd <= 7) score = dd - (sim ? 10 : 0);
+      else if (amt && sim && dd <= 60) score = 100 + dd;
+      else if (sim && dd <= 3) score = 200 + dd;
+      if (score != null) pairs.push({ d, p, score });
+    }
+  }
+  pairs.sort((a, b) => a.score - b.score);
+  for (const { d, p } of pairs) {
+    if (res.get(d.id).match || used.has(p.id)) continue;
+    Object.assign(res.get(d.id), { match: p.id, auto: true });
+    used.set(p.id, d.id);
+  }
+
+  for (const d of declared) {
+    const v = res.get(d.id);
+    const c = curOf(d);
+    const amount = receiptTotal(d);
+    const p = v.match && getReceipt(v.match);
+    const own = adultPart(d);
+    if (own.amount > 0) {
+      add(d, "bad", "adultDeclared", { a: fmtMoney(own.amount, c), items: own.items });
+      v.adult = own.amount;
+    }
+    if (!p) add(d, "warn", "noProof");
+    else {
+      const pt = receiptTotal(p);
+      const kids = isTagged(p) ? allocation(p).kids : null;
+      if (!sameMoney(amount, pt) && !(kids != null && sameMoney(amount, kids))) {
+        add(d, amount > pt ? "bad" : "warn", "amountDiff", { a: fmtMoney(amount, c), b: fmtMoney(pt, c), id: p.id, d: fmtMoney(amount - pt, c) });
+      } else if (kids != null && amount > kids + 0.01) {
+        add(d, "bad", "inclNotKids", { k: fmtMoney(kids, c), id: p.id });
+        v.adult = round2(amount - kids);
+      }
+      const pa = kids == null ? adultPart(p) : null;
+      if (pa?.amount > 0 && amount > pt - pa.amount + 0.01) {
+        add(d, "bad", "inclAdult", { a: fmtMoney(pa.amount, c), items: pa.items, id: p.id });
+        v.adult = Math.max(v.adult || 0, round2(Math.min(amount, pa.amount)));
+      }
+      if (d.date && p.date && daysApart(d.date, p.date) > 7) add(d, "warn", "dateDiff", { a: d.date, b: p.date, id: p.id });
+    }
+    const twice = declared.filter((x) => x.id !== d.id && curOf(x) === c && sameMoney(receiptTotal(x), amount)
+      && ((d.date && x.date === d.date) || (daysApart(x.date, d.date) <= 3 && similar(x, d))));
+    if (twice.length) add(d, "bad", "twice", { ids: ids(twice) });
+    if (p) {
+      const shared = declared.filter((x) => x.id !== d.id && x.justifiedBy === p.id);
+      if (shared.length) add(d, "bad", "proofShared", { id: p.id, ids: ids(shared) });
+    }
+    const paidByMe = mine.filter((x) => curOf(x) === c && sameMoney(receiptTotal(x), amount) && daysApart(x.date, d.date) <= 3);
+    if (paidByMe.length) add(d, "bad", "paidByMe", { ids: ids(paidByMe) });
+    if (d.date && d.date > today()) add(d, "bad", "future", { d: d.date });
+  }
+
+  // 2. The other parent's photos/PDFs.
+  const imgFiles = files.filter((f) => f.img?.dhash);
+  for (const p of proofs) {
+    const c = curOf(p);
+    const f = fileOf(p);
+    const mm = totalMismatch(p);
+    if (mm) add(p, "bad", "math", { a: fmtNum(mm.expected), b: fmtNum(mm.printed) });
+    if (p.authenticity_concerns) add(p, "bad", "claude", { n: p.authenticity_concerns });
+    if (p.document_type === "invoice" && !p.paymentProof) add(p, "warn", "notPaid");
+    const pa = adultPart(p);
+    if (pa.amount > 0) add(p, "warn", "adultItems", { a: fmtMoney(pa.amount, c), items: pa.items });
+    if (p.date && p.date > today()) add(p, "bad", "future", { d: p.date });
+    if (!p.date) add(p, "warn", "noDate");
+    const ex = f?.img?.exif;
+    if (ex?.taken && p.date && ex.taken.slice(0, 10) < p.date && daysApart(ex.taken.slice(0, 10), p.date) >= 1) {
+      add(p, "bad", "photoBefore", { t: ex.taken.replace("T", " "), d: p.date });
+    }
+    if (ex?.software && EDITOR_RE.test(ex.software)) add(p, "bad", "edited", { s: ex.software });
+    if (f?.img?.dhash) {
+      const same = imgFiles.filter((g) => g.id !== f.id && g.img.dhash.length === f.img.dhash.length && hamming(g.img.dhash, f.img.dhash) <= 24);
+      const rIds = same.flatMap((g) => g.receiptIds || []).filter((id) => getReceipt(id) && !getReceipt(id).voided);
+      if (rIds.length) add(p, "bad", "samePhoto", { ids: [...new Set(rIds)].join(", ") });
+    }
+    const num = String(p.receipt_number || "").replace(/\W/g, "");
+    if (num.length >= 4) {
+      const reused = active.filter((x) => x.id !== p.id && x.fileId !== p.fileId
+        && String(x.receipt_number || "").replace(/\W/g, "") === num && similar(x, p));
+      const mineToo = reused.filter((x) => x.payer !== "other");
+      if (mineToo.length) add(p, "bad", "numberMine", { n: p.receipt_number, ids: ids(mineToo) });
+      else if (reused.length) add(p, "bad", "number", { n: p.receipt_number, ids: ids(reused) });
+    }
+    const paidByMe = mine.filter((x) => curOf(x) === c && sameMoney(receiptTotal(x), receiptTotal(p))
+      && ((p.date && x.date === p.date && similar(x, p)) || (daysApart(x.date, p.date) <= 1 && similar(x, p))));
+    if (paidByMe.length) add(p, "bad", "paidByMe", { ids: ids(paidByMe) });
+    if (used.has(p.id)) res.get(p.id).match = used.get(p.id);
+    if (ex?.taken) add(p, "info", "taken", { t: ex.taken.replace("T", " "), cam: [ex.make, ex.model].filter(Boolean).map((x, i) => (i ? " " : " · ") + x).join("") });
+    else if (f?.kind === "image") add(p, "info", "noExif");
+  }
+  // A declared line is only as good as the document behind it.
+  for (const d of declared) {
+    const v = res.get(d.id);
+    const pv = v.match && res.get(v.match);
+    if (pv?.issues.some((i) => i.level === "bad")) add(d, "warn", "proofFlagged", { id: v.match });
+  }
+  for (const v of res.values()) {
+    v.level = v.issues.some((i) => i.level === "bad") ? "bad" : v.issues.some((i) => i.level === "warn") ? "warn" : "ok";
+  }
+  return res;
+}
+
+/** An entry still needs your attention: something looks wrong and you haven't accepted or disputed it. */
+const needsCheck = (r, v) => v && v.level !== "ok" && !r.check?.decision;
+const issueText = (i) => t(`vf.${i.key}`, i.vars);
+
+/** Totals per currency for the report: declared, backed by a document, without one, disputed… */
+function verifySummary(list, ver = verifyOther()) {
+  const by = {};
+  for (const r of list) {
+    const v = ver.get(r.id);
+    if (!v || r.voided) continue;
+    const c = curOf(r);
+    const x = by[c] ??= { c, declared: 0, nDeclared: 0, backed: 0, nBacked: 0, noProof: 0, nNoProof: 0, diff: 0, nDiff: 0,
+      disputed: 0, nDisputed: 0, adult: 0, nAdult: 0, nProofs: 0, nFlagged: 0, nToCheck: 0 };
+    const amt = receiptTotal(r);
+    if (r.check?.decision === "disputed") { x.disputed += amt; x.nDisputed += 1; }
+    if (needsCheck(r, v)) x.nToCheck += 1;
+    if (v.kind === "proof") {
+      x.nProofs += 1;
+      if (v.issues.some((i) => i.level === "bad")) x.nFlagged += 1;
+      continue;
+    }
+    x.declared += amt; x.nDeclared += 1;
+    if (v.adult > 0) { x.adult += v.adult; x.nAdult += 1; }
+    const p = v.match && getReceipt(v.match);
+    if (!p) { x.noProof += amt; x.nNoProof += 1; continue; }
+    const diff = v.issues.find((i) => i.key === "amountDiff");
+    if (diff) { x.diff += amt - receiptTotal(p); x.nDiff += 1; } else { x.backed += amt; x.nBacked += 1; }
+  }
+  return Object.values(by).map((x) => Object.fromEntries(Object.entries(x).map(([k, v]) => [k, typeof v === "number" && !k.startsWith("n") ? round2(v) : v])));
+}
+
+/** One line per entry for the report / Excel: status and the problems found. */
+function verifyText(r, v) {
+  if (!v) return "";
+  const p = v.kind === "declared" && v.match && getReceipt(v.match);
+  const head = v.kind === "declared"
+    ? (p ? t("vf.backedBy", { id: p.id, m: v.auto ? t("vf.auto") : t("vf.manualLink") }) : t("vf.noProofShort"))
+    : t("vf.proofShort");
+  const probs = v.issues.filter((i) => i.level !== "info").map(issueText);
+  const dec = r.check?.decision === "accepted" ? t("vf.acceptedShort")
+    : r.check?.decision === "disputed" ? t("vf.disputedShort", { r: r.check.reason || "" }) : "";
+  return [head, ...probs, dec].filter(Boolean).join(" · ");
+}
+
 function totalsFor(list) {
   const byCur = {};
   for (const r of list) {
@@ -692,6 +936,34 @@ async function togglePayer(r) {
   r.payer = r.payer === "other" ? "me" : "other";
   await saveReceipt(r);
   await log("payer_changed", r.id, `${from} → ${payerLabel(r)}`);
+  render();
+}
+
+/** Declared row ↔ the photo/PDF that backs it up (empty = let the app match automatically). */
+async function setJustification(d, proofId) {
+  const before = d.justifiedBy || "";
+  if (before === proofId) return;
+  d.justifiedBy = proofId || null;
+  await saveReceipt(d);
+  await log(proofId ? "claim_linked" : "claim_unlinked", d.id, proofId ? t("lg.claimLinked", { id: proofId }) : t("lg.claimUnlinked", { id: before }));
+  render();
+}
+
+/** Your decision on one of the other parent's entries: accepted, disputed (with a reason), or undecided. */
+async function decideClaim(r, decision, ver) {
+  let reason = "";
+  if (decision === "disputed") {
+    const v = ver?.get(r.id);
+    const suggested = r.check?.reason || (v ? v.issues.filter((i) => i.level === "bad").map(issueText).join(" ; ") : "");
+    const input = prompt(t("p.dispute"), suggested);
+    if (input == null) return;
+    reason = input.trim();
+    if (!reason) { toast(t("t.reasonNeeded")); return; }
+  }
+  r.check = decision ? { decision, reason, ts: new Date().toISOString() } : null;
+  await saveReceipt(r);
+  await log(decision === "accepted" ? "claim_accepted" : decision === "disputed" ? "claim_disputed" : "claim_reset", r.id,
+    decision === "disputed" ? reason : `${r.store_name || ""} ${r.date || ""} ${fmtMoney(receiptTotal(r), curOf(r))}`.trim());
   render();
 }
 
@@ -1158,6 +1430,20 @@ function shortNote(n) {
   return first.length > 140 ? `${first.slice(0, 137).trimEnd()}…` : first;
 }
 
+/** The other parent's totals as short sentences (report, summary, PDF). */
+function verifyLines(x) {
+  const m = (v) => fmtMoney(v, x.c);
+  return [
+    x.nDeclared && t("vf.lDeclared", { n: x.nDeclared, a: m(x.declared) }),
+    x.nDeclared && t("vf.lBacked", { n: x.nBacked, a: m(x.backed) }),
+    x.nDiff && t("vf.lDiff", { n: x.nDiff, a: m(x.diff) }),
+    x.nNoProof && t("vf.lNoProof", { n: x.nNoProof, a: m(x.noProof) }),
+    x.nAdult && t("vf.lAdult", { n: x.nAdult, a: m(x.adult) }),
+    x.nFlagged && t("vf.lFlagged", { n: x.nFlagged, p: x.nProofs }),
+    x.nDisputed && t("vf.lDisputed", { n: x.nDisputed, a: m(x.disputed) }),
+  ].filter(Boolean);
+}
+
 function buildReport() {
   const list = reportReceipts();
   const active = list.filter((r) => !r.voided);
@@ -1206,6 +1492,15 @@ function buildReport() {
 
   const unverified = active.filter((r) => !r.reviewed).length;
   if (unverified) L.push(t("r.unverified", { n: unverified }), "");
+  const ver = verifyOther();
+  const vsum = verifySummary(active, ver);
+  if (vsum.length) {
+    L.push(t("vf.title"));
+    for (const x of vsum) L.push(...verifyLines(x).map((l) => `  ${l}`));
+    const flagged = active.filter((r) => ver.get(r.id) && (ver.get(r.id).level !== "ok" || r.check?.decision));
+    for (const r of flagged) L.push(`  - ${r.id} ${r.date || ""} ${r.store_name || ""} ${fmtMoney(receiptTotal(r), curOf(r))}: ${verifyText(r, ver.get(r.id))}`);
+    L.push("");
+  }
   if (anyTagged) L.push(t("r.legend"), t("r.legend2"), "");
   L.push(t("r.dateLegend"), "");
   L.push(t("r.receiptsHdr"));
@@ -1240,6 +1535,7 @@ function buildReport() {
     if (r.note) L.push(t("r.note", { n: r.note }));
     if (r.notes) L.push(t("r.readingNote", { n: shortNote(r.notes) }));
     if (dupes.has(r.id)) L.push(t("r.dupe", { ids: dupes.get(r.id).join(", ") }));
+    if (ver.has(r.id)) L.push(`  ${t("vf.blockTitle")}: ${verifyText(r, ver.get(r.id))}`);
     L.push(t("r.original", { name: r.source, sha: r.sha256.slice(0, 16), ts: fmtTs(r.addedAt) }));
   }
   if (voided.length) {
@@ -1287,12 +1583,13 @@ const proofText = (r) => (r.paymentProof
 /** One row per receipt. */
 function receiptRows(list) {
   const rows = [t("xl.receiptsHdr")];
+  const ver = verifyOther();
   for (const r of list) {
     const a = allocation(r);
     rows.push([
       r.id, r.date, r.time, r.store_name, docLabel(r), payerLabel(r), curOf(r), r.subtotal, r.tax, extraDiscount(r) || null, r.tip, a.total,
       a.kids, a.not, a.review, r.payment_method, yesNo(r.reviewed), yesNo(r.voided), r.voidReason, yesNo(r.declared), r.source_ref,
-      r.note, r.notes, r.source, r.sha256, r.addedAt, proofText(r),
+      r.note, r.notes, r.source, r.sha256, r.addedAt, proofText(r), verifyText(r, ver.get(r.id)),
     ]);
   }
   return rows;
@@ -1304,7 +1601,7 @@ function buildItemsCsv(list = reportReceipts()) {
 
 function buildXlsx(list = reportReceipts()) {
   return makeXlsx([
-    { name: t("xl.sheetReceipts"), rows: receiptRows(list), money: [7, 8, 9, 10, 11, 12, 13, 14], widths: { 24: 20 } },
+    { name: t("xl.sheetReceipts"), rows: receiptRows(list), money: [7, 8, 9, 10, 11, 12, 13, 14], widths: { 24: 20, 27: 60 } },
     { name: t("xl.sheetItems"), rows: itemRows(list), money: [9, 10, 14, 17, 18], widths: { 28: 20 } },
   ]);
 }
@@ -1496,6 +1793,13 @@ function checkLines(list) {
   if (declared) out.push(t("chk.declared", { n: declared }));
   const noDate = active.filter((r) => !r.date).length;
   if (noDate) out.push(t("chk.noDate", { n: noDate }));
+  for (const x of verifySummary(active)) {
+    if (x.nNoProof) out.push(t("vf.lNoProof", { n: x.nNoProof, a: fmtMoney(x.noProof, x.c) }));
+    if (x.nDiff) out.push(t("vf.lDiff", { n: x.nDiff, a: fmtMoney(x.diff, x.c) }));
+    if (x.nFlagged) out.push(t("vf.lFlagged", { n: x.nFlagged, p: x.nProofs }));
+    if (x.nAdult) out.push(t("vf.lAdult", { n: x.nAdult, a: fmtMoney(x.adult, x.c) }));
+    if (x.nDisputed) out.push(t("vf.lDisputed", { n: x.nDisputed, a: fmtMoney(x.disputed, x.c) }));
+  }
   const voided = list.length - active.length;
   if (voided) out.push(t("chk.voided", { n: voided }));
   return out;
@@ -1767,6 +2071,23 @@ async function buildPdf(list = reportReceipts()) {
   if (anyTagged) text(`${t("pdf.legend")} ${t("r.legend2")}`, { size: 8, color: MUTED, gap: 1 });
   text(t("r.dateLegend"), { size: 8, color: MUTED, gap: 12 });
 
+  // The other parent's entries: what backs them up
+  const ver = verifyOther();
+  const vsum = verifySummary(active, ver);
+  if (vsum.length) {
+    text(t("vf.title"), { size: 11, bold: true, gap: 2 });
+    for (const x of vsum) for (const l of verifyLines(x)) text(`•  ${l}`, { size: 9, gap: 1 });
+    y += 4;
+    const rows = active.filter((r) => ver.get(r.id) && (ver.get(r.id).level !== "ok" || r.check?.decision));
+    if (rows.length) {
+      table({
+        head: [[t("pdf.id"), t("pdf.date"), t("pdf.store"), t("pdf.total"), t("vf.pdfCheck")]],
+        body: rows.map((r) => [r.id, r.date || "", r.store_name || "", fmtMoney(receiptTotal(r), curOf(r)), verifyText(r, ver.get(r.id))]),
+        columnStyles: { 0: { cellWidth: 62 }, 1: { cellWidth: 58 }, 2: { cellWidth: 90 }, 3: { cellWidth: 62, halign: "right" } },
+      });
+    }
+  }
+
   // One section per receipt
   text(t("r.receiptsHdr"), { size: 13, bold: true, gap: 6 });
   for (const r of active) {
@@ -1790,6 +2111,7 @@ async function buildPdf(list = reportReceipts()) {
       r.declared && `${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`,
       r.manual && t("badge.manual"),
       dupes.has(r.id) && t("badge.dupe", { ids: dupes.get(r.id).join(", ") }),
+      ver.has(r.id) && ver.get(r.id).level !== "ok" && `${t("vf.blockTitle")}: ${verifyText(r, ver.get(r.id))}`,
     ].filter(Boolean);
     if (flags.length) text(flags.join("   ·   "), { size: 9, color: WARN, gap: 2 });
     const good = [
@@ -1962,7 +2284,7 @@ function render() {
 
   // Intake queue: only files not yet extracted.
   const open = files.filter((f) => f.status !== "done");
-  $("#queue").replaceChildren(...open.map((f) => h("li", {},
+  $("#queue").replaceChildren(...open.map((f) => h("li", { class: f.sensitive ? "wide-actions" : null },
     thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" })
       : h("div", { class: "thumb", "aria-hidden": "true" }, f.role === "statement" ? "🏦" : f.kind === "pdf" ? "📄" : f.kind === "sheet" ? "📊" : "🧾"),
     h("div", {},
@@ -2020,17 +2342,24 @@ function render() {
   $("#totals").replaceChildren(...stats.map(([label, value, cls]) =>
     h("div", { class: `stat ${cls || ""}` }, h("div", { class: "label" }, label), h("div", { class: "value" }, value))));
 
+  // Other parent's entries: what backs them up
+  const ver = verifyOther();
+  renderOtherCheck(ver);
+
   // Filters
   const dupes = duplicateIds();
   const counts = {
+    tocheck: active.filter((r) => needsCheck(r, ver.get(r.id))).length,
     all: active.length,
     untagged: active.filter((r) => allocation(r).pending > 0).length,
     unverified: active.filter((r) => !r.reviewed).length,
     dupe: dupes.size,
     void: receipts.length - active.length,
+    other: active.filter((r) => r.payer === "other").length,
   };
   document.querySelectorAll(".chip-filter").forEach((b) => {
     const key = b.dataset.filter;
+    b.hidden = (key === "tocheck" || key === "other") && !counts.other;
     b.setAttribute("aria-selected", String(key === filter));
     b.replaceChildren(t(b.dataset.labelKey), h("span", { class: "count" }, counts[key]));
   });
@@ -2043,12 +2372,14 @@ function render() {
       if (filter === "untagged") return allocation(r).pending > 0;
       if (filter === "unverified") return !r.reviewed;
       if (filter === "dupe") return dupes.has(r.id);
+      if (filter === "tocheck") return needsCheck(r, ver.get(r.id));
+      if (filter === "other") return r.payer === "other";
       return true;
     })
     .filter((r) => !q || [r.id, r.store_name, r.date, r.note, ...r.items.map((i) => i.description)]
       .some((s) => s && String(s).toLowerCase().includes(q)))
     .sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.id.localeCompare(a.id));
-  $("#receipts").replaceChildren(...(visible.length ? visible.map((r) => renderReceipt(r, dupes)) : [h("p", { class: "hint" }, t("nothing"))]));
+  $("#receipts").replaceChildren(...(visible.length ? visible.map((r) => renderReceipt(r, dupes, ver)) : [h("p", { class: "hint" }, t("nothing"))]));
 
   renderStatements();
   $("#history").replaceChildren(...logEntries.slice(-200).reverse().map((e) =>
@@ -2147,7 +2478,69 @@ function typeSelect(r, idx, it) {
   names.map((n) => h("option", { value: n, selected: n === it.exp_type }, n)));
 }
 
-function renderReceipt(r, dupes) {
+/** Summary card: the other parent's declared amounts and what backs them up. */
+function renderOtherCheck(ver) {
+  const card = $("#otherCheck");
+  const sums = verifySummary(receipts, ver);
+  card.hidden = !sums.length;
+  if (!sums.length) return;
+  const line = (cls, label, n, amt, c) => h("div", { class: `vf-row ${cls}` },
+    h("span", {}, label, h("span", { class: "count" }, n)), h("b", {}, amt == null ? "" : fmtMoney(amt, c)));
+  const toCheck = sums.reduce((n, x) => n + x.nToCheck, 0);
+  card.replaceChildren(
+    h("h3", {}, t("vf.title")),
+    ...sums.map((x) => h("div", { class: "vf-sum" },
+      sums.length > 1 ? h("div", { class: "meta" }, x.c) : null,
+      x.nDeclared ? [
+        line("", t("vf.sDeclared"), x.nDeclared, x.declared, x.c),
+        line("ok", t("vf.sBacked"), x.nBacked, x.backed, x.c),
+        x.nDiff ? line("bad", t("vf.sDiff"), x.nDiff, x.diff, x.c) : null,
+        x.nNoProof ? line("warn", t("vf.sNoProof"), x.nNoProof, x.noProof, x.c) : null,
+        x.nAdult ? line("bad", t("vf.sAdult"), x.nAdult, x.adult, x.c) : null,
+      ] : null,
+      x.nProofs ? line(x.nFlagged ? "bad" : "ok", t("vf.sProofs", { n: x.nFlagged }), x.nProofs, null, x.c) : null,
+      x.nDisputed ? line("bad", t("vf.sDisputed"), x.nDisputed, x.disputed, x.c) : null)),
+    h("p", { class: "hint" }, t("vf.hint")),
+    toCheck ? h("button", { class: "btn small primary", onclick: () => { filter = "tocheck"; render(); } }, t("vf.show", { n: toCheck }))
+      : h("p", { class: "hint ok" }, t("vf.allDone")));
+}
+
+/** The check block inside one of the other parent's entries. */
+function renderCheckBlock(r, v, ver) {
+  const c = curOf(r);
+  const p = v.kind === "declared" && v.match && getReceipt(v.match);
+  const head = v.kind === "declared"
+    ? (p ? h("div", { class: "vf-head ok" }, t("vf.backedBy", { id: p.id, m: v.auto ? t("vf.auto") : t("vf.manualLink") }),
+      h("span", { class: "meta" }, ` — ${p.store_name || ""} ${p.date || ""} ${fmtMoney(receiptTotal(p), curOf(p))}`))
+      : h("div", { class: "vf-head warn" }, t("vf.noProofShort")))
+    : (v.match ? h("div", { class: "vf-head ok" }, t("vf.supports", { id: v.match })) : h("div", { class: "vf-head" }, t("vf.proofShort")));
+  const issues = v.issues.map((i) => h("li", { class: i.level }, issueText(i)));
+  let linker = null;
+  if (v.kind === "declared" && !r.voided) {
+    const cands = receipts.filter((x) => !x.voided && x.payer === "other" && !x.declared && curOf(x) === c)
+      .sort((a, b) => Math.abs(receiptTotal(a) - receiptTotal(r)) - Math.abs(receiptTotal(b) - receiptTotal(r)));
+    linker = h("select", {
+      class: "type-select", "aria-label": t("vf.linkAria"),
+      onchange: (e) => setJustification(r, e.target.value),
+    }, h("option", { value: "", selected: !r.justifiedBy }, t("vf.linkAuto")),
+    cands.map((x) => h("option", { value: x.id, selected: x.id === r.justifiedBy },
+      `${x.id} · ${x.date || "—"} · ${x.store_name || ""} · ${fmtMoney(receiptTotal(x), curOf(x))}`)));
+  }
+  const dec = r.check?.decision;
+  return h("div", { class: `vf-block ${dec || v.level}` },
+    h("div", { class: "vf-title" }, t("vf.blockTitle"),
+      dec ? h("span", { class: `badge ${dec === "accepted" ? "ok" : "bad"}` },
+        dec === "accepted" ? t("vf.acceptedShort") : t("vf.disputedShort", { r: r.check.reason })) : null),
+    head,
+    issues.length ? h("ul", { class: "vf-issues" }, issues) : null,
+    linker,
+    !r.voided && h("div", { class: "actions" },
+      dec !== "accepted" && h("button", { class: "btn small", onclick: () => decideClaim(r, "accepted", ver) }, t("vf.accept")),
+      dec !== "disputed" && h("button", { class: "btn small danger", onclick: () => decideClaim(r, "disputed", ver) }, t("vf.dispute")),
+      dec && h("button", { class: "btn small ghost", onclick: () => decideClaim(r, null, ver) }, t("vf.undo"))));
+}
+
+function renderReceipt(r, dupes, ver) {
   const c = curOf(r);
   const a = allocation(r);
   const itemsSum = r.items.reduce((s, it) => s + (it.line_total || 0), 0);
@@ -2162,6 +2555,7 @@ function renderReceipt(r, dupes) {
   if (tagged && a.pending) badges.push(h("span", { class: "badge warn" }, t("badge.untagged", { n: a.pending })));
   if (dupes.has(r.id)) badges.push(h("span", { class: "badge bad" }, t("badge.dupe", { ids: dupes.get(r.id).join(", ") })));
   if (r.payer === "other") badges.push(h("span", { class: "badge other" }, t("badge.payerOther")));
+  if (r.check?.decision === "disputed") badges.push(h("span", { class: "badge bad" }, t("vf.disputedBadge")));
   if (r.declared) badges.push(h("span", { class: "badge warn" }, t("badge.declared")));
   if (r.manual) badges.push(h("span", { class: "badge manual" }, t("badge.manual")));
   if (r.fromStatement) badges.push(h("span", { class: "badge ok" }, t("badge.fromStatement")));
@@ -2207,6 +2601,7 @@ function renderReceipt(r, dupes) {
     tagged
       ? h("div", { class: "kids-line" }, t("forKids"), h("b", {}, fmtMoney(a.kids, c)), t("ofTotal", { t: fmtMoney(a.total, c) }))
       : h("div", { class: "kids-line" }, t("totalLabel"), h("b", {}, fmtMoney(a.total, c)), h("span", { class: "meta" }, t("notSeparated"))),
+    ver?.has(r.id) && renderCheckBlock(r, ver.get(r.id), ver),
     r.note && h("div", { class: "meta" }, `📝 ${r.note}`),
     r.notes && h("details", { class: "reading-note" }, h("summary", {}, t("readingNoteToggle")), h("p", {}, r.notes)),
     h("div", { class: "table-wrap" },
@@ -2307,8 +2702,8 @@ document.querySelectorAll("[data-payer]").forEach((b) => b.addEventListener("cli
 }));
 renderPayerToggle();
 
-$("#sensitiveToggle").checked = settings.intakeSensitive;
-$("#sensitiveToggle").addEventListener("change", (e) => store.set("intakeSensitive", e.target.checked ? "1" : ""));
+// The old "sensitive documents" checkbox is gone: forget its saved state.
+try { localStorage.removeItem("intakeSensitive"); } catch { /* storage unavailable */ }
 
 $("#mAddLine").addEventListener("click", () => { const row = manualLine(); $("#mItems").append(row); row.querySelector(".desc").focus(); });
 $("#manualForm").addEventListener("submit", async (e) => {
@@ -2401,3 +2796,4 @@ try {
   toast(t("t.noStorage"), 6000);
 }
 render();
+backfillImageInfo().catch((err) => console.warn("image check", err));
