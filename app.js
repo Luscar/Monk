@@ -1,6 +1,6 @@
 import Anthropic from "./vendor/anthropic-sdk.js";
 import { db } from "./db.js";
-import { makeZip } from "./zip.js";
+import { makeZip, readZip } from "./zip.js";
 
 // ---------------------------------------------------------------------------
 // Settings (small values in localStorage; files/receipts/log live in IndexedDB)
@@ -19,6 +19,7 @@ const settings = {
   get model() { return store.get("model", "claude-opus-5-5"); },
   get defaultEmail() { return store.get("defaultEmail"); },
   get currency() { return (store.get("defaultCurrency") || "USD").toUpperCase(); },
+  get autoTag() { return store.get("autoTag") === "1"; },
   get kidsContext() { return store.get("kidsContext").trim(); },
   get splitDefault() {
     const raw = store.get("splitDefault").trim();
@@ -365,7 +366,7 @@ async function createReceipts(file, extracted) {
       items: (x.items || []).map((it) => ({
         ...it,
         ai_suggestion: it.likely_for_children,
-        alloc: SUGGESTION_TO_ALLOC[it.likely_for_children] || "review",
+        alloc: settings.autoTag ? SUGGESTION_TO_ALLOC[it.likely_for_children] || "review" : "review",
         split_pct: settings.splitDefault,
       })),
       reviewed: false,
@@ -484,17 +485,20 @@ function totalsFor(list) {
   for (const r of list) {
     const c = curOf(r);
     const a = allocation(r);
-    byCur[c] ??= { kids: 0, not: 0, review: 0, total: 0, pending: 0, count: 0 };
+    byCur[c] ??= { kids: 0, not: 0, review: 0, total: 0, tax: 0, pending: 0, count: 0 };
     const t = byCur[c];
-    t.kids += a.kids; t.not += a.not; t.review += a.review; t.total += a.total; t.pending += a.pending; t.count += 1;
+    t.kids += a.kids; t.not += a.not; t.review += a.review; t.total += a.total;
+    t.tax += r.tax || 0; t.pending += a.pending; t.count += 1;
   }
   return byCur;
 }
 
+const isTagged = (r) => r.items.some((i) => i.alloc !== "review");
+
 // ---------------------------------------------------------------------------
 // Edits (all logged)
 // ---------------------------------------------------------------------------
-const ALLOC_LABEL = { kids: "Kids", split: "Split", not: "Not kids", review: "Review?" };
+const ALLOC_LABEL = { kids: "Kids", split: "Split", not: "Not kids", review: "Untagged" };
 const NEXT_ALLOC = { review: "kids", kids: "split", split: "not", not: "kids" };
 const getReceipt = (id) => receipts.find((r) => r.id === id);
 
@@ -525,6 +529,7 @@ async function setAll(r, alloc) {
   changed.forEach((it) => { it.alloc = alloc; });
   await saveReceipt(r);
   await log("tag_changed", r.id, `${changed.length} item(s) → ${ALLOC_LABEL[alloc]}`);
+  if (alloc === "review") toast("Tags cleared.");
   render();
 }
 
@@ -591,14 +596,143 @@ async function toggleVoid(r) {
   render();
 }
 
+/** "Verified" = you checked the amounts against the paper receipt. Independent of tagging. */
 async function toggleReviewed(r) {
-  const a = allocation(r);
-  if (!r.reviewed && a.pending) {
-    if (!confirm(`${a.pending} item(s) are still "Review?" and won't count as kids. Mark reviewed anyway?`)) return;
-  }
   r.reviewed = !r.reviewed;
   await saveReceipt(r);
-  await log(r.reviewed ? "marked_reviewed" : "unmarked_reviewed", r.id, `kids ${fmtNum(a.kids)} of ${fmtNum(a.total)} ${curOf(r)}`);
+  await log(r.reviewed ? "marked_verified" : "unmarked_verified", r.id, `total ${fmtNum(receiptTotal(r))} ${curOf(r)}`);
+  render();
+}
+
+/** Applies Claude's yes/no suggestions to untagged items only. Returns how many changed. */
+function applySuggestionsTo(r) {
+  let n = 0;
+  for (const it of r.items) {
+    const to = SUGGESTION_TO_ALLOC[it.ai_suggestion];
+    if (it.alloc === "review" && to && to !== "review") { it.alloc = to; n += 1; }
+  }
+  return n;
+}
+
+const suggestableCount = (r) => r.voided ? 0
+  : r.items.filter((it) => it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")).length;
+
+async function applySuggestions(r) {
+  const n = applySuggestionsTo(r);
+  if (!n) { toast("No suggestions to apply — tag the remaining lines by hand."); return; }
+  await saveReceipt(r);
+  await log("suggestions_applied", r.id, `${n} item(s) tagged from Claude's suggestions`);
+  render();
+}
+
+async function applyAllSuggestions() {
+  const targets = receipts.filter((r) => suggestableCount(r));
+  const total = targets.reduce((s, r) => s + suggestableCount(r), 0);
+  if (!total || !confirm(`Tag ${total} item(s) on ${targets.length} receipt(s) using Claude's suggestions? Items Claude was unsure about (e.g. groceries) stay untagged. You can change any tag afterwards.`)) return;
+  for (const r of targets) {
+    const n = applySuggestionsTo(r);
+    await saveReceipt(r);
+    await log("suggestions_applied", r.id, `${n} item(s) tagged from Claude's suggestions (bulk)`);
+  }
+  toast(`Tagged ${total} item(s).`);
+  render();
+}
+
+async function shareOrDownload(file, title) {
+  try {
+    if (navigator.canShare?.({ files: [file] })) {
+      await navigator.share({ files: [file], title });
+      return;
+    }
+  } catch (err) {
+    if (err?.name === "AbortError") return;
+  }
+  download(file);
+}
+
+const fileOf = (r) => files.find((x) => x.id === r.fileId);
+
+/** Save the untouched original (e.g. into Photos via the share sheet). */
+async function saveOriginal(r) {
+  const f = fileOf(r);
+  if (!f?.blob) { toast("Original file not found on this device."); return; }
+  await shareOrDownload(new File([f.blob], f.name, { type: f.type }), f.name);
+}
+
+function wrapText(ctx, text, maxWidth) {
+  const words = text.split(" ");
+  const lines = [];
+  let line = "";
+  for (const w of words) {
+    const test = line ? `${line} ${w}` : w;
+    if (ctx.measureText(test).width > maxWidth && line) { lines.push(line); line = w; }
+    else line = test;
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+/**
+ * A copy of the photo with a banner listing its receipt ID(s), store, date, total and the
+ * original's fingerprint. Meant for printing/sharing; the original stays untouched.
+ */
+async function stampedImage(f) {
+  if (f.kind !== "image" || !f.blob) return null;
+  let bmp;
+  try { bmp = await createImageBitmap(f.blob, { imageOrientation: "from-image" }); } catch { return null; }
+  const scale = Math.min(1, 3000 / Math.max(bmp.width, bmp.height));
+  const w = Math.max(600, Math.round(bmp.width * scale));
+  const ih = Math.round(bmp.height * (w / bmp.width));
+  const font = Math.max(16, Math.round(w * 0.026));
+  const lineH = Math.round(font * 1.35);
+  const pad = Math.round(font * 0.8);
+
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = `600 ${font}px system-ui, sans-serif`;
+  const rs = (f.receiptIds || []).map(getReceipt).filter(Boolean);
+  const raw = [
+    ...rs.map((r) => `${r.id} · ${r.store_name || "Unknown store"} · ${r.date || "no date"} · Total ${fmtMoney(receiptTotal(r), curOf(r))}${r.voided ? " · VOIDED" : ""}`),
+    `Original: ${f.name} · added ${fmtTs(f.addedAt)} UTC`,
+    "SHA-256 fingerprint of original:",
+    f.sha256.slice(0, 32),
+    f.sha256.slice(32),
+  ];
+  const lines = raw.flatMap((t) => wrapText(measure, t, w - pad * 2));
+  const bannerH = pad * 2 + lineH * lines.length;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = ih + bannerH;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, w, ih);
+  ctx.drawImage(bmp, 0, 0, w, ih);
+  bmp.close?.();
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, ih, w, bannerH);
+  ctx.fillStyle = "#fff";
+  ctx.textBaseline = "top";
+  lines.forEach((t, i) => {
+    const mono = i >= lines.length - 2;
+    ctx.font = mono ? `500 ${font}px ui-monospace, Menlo, monospace` : `${i < rs.length ? 700 : 500} ${font}px system-ui, sans-serif`;
+    ctx.fillText(t, pad, ih + pad + i * lineH);
+  });
+  return new Promise((res) => canvas.toBlob(res, "image/jpeg", 0.9));
+}
+
+function stampedName(f) {
+  const base = safeName(f.name.replace(/\.[a-z0-9]+$/i, ""));
+  return `${(f.receiptIds || []).join("+") || f.id}__${base}-stamped.jpg`;
+}
+
+async function saveStamped(r) {
+  const f = fileOf(r);
+  if (!f?.blob) { toast("Original file not found on this device."); return; }
+  if (f.kind !== "image") { toast("Stamped copies are for photos. PDFs are kept as the original document."); return; }
+  const blob = await stampedImage(f);
+  if (!blob) { toast("This browser can't read that image format."); return; }
+  await log("stamped_copy", r.id, `stamped copy of ${f.name} created`);
+  await shareOrDownload(new File([blob], stampedName(f), { type: "image/jpeg" }), r.id);
   render();
 }
 
@@ -643,35 +777,61 @@ function buildReport() {
   const active = list.filter((r) => !r.voided);
   const voided = list.filter((r) => r.voided);
   const totals = totalsFor(active);
+  const anyTagged = active.some(isTagged);
   const dupes = duplicateIds();
   const L = [];
-  L.push("CHILD EXPENSE REPORT");
+  L.push(anyTagged ? "RECEIPTS & CHILD EXPENSE REPORT" : "RECEIPT REPORT");
   L.push(`Period: ${periodLabel()}`);
   L.push(`Generated: ${fmtTs(new Date().toISOString())}`);
   L.push(`Receipts: ${active.length}${voided.length ? ` (+${voided.length} voided, excluded)` : ""}`);
   L.push("");
   for (const [c, t] of Object.entries(totals)) {
-    L.push(`SPENT ON CHILDREN: ${fmtMoney(t.kids, c)}`);
-    L.push(`  Not for children (excluded): ${fmtMoney(t.not, c)}`);
-    if (t.pending) L.push(`  Still to review: ${t.pending} item(s), ${fmtMoney(t.review, c)} (not counted above)`);
-    L.push(`  Total of all receipts: ${fmtMoney(t.total, c)}`);
+    L.push(`TOTAL SPENT: ${fmtMoney(t.total, c)}  (incl. tax ${fmtMoney(t.tax, c)})`);
+    if (anyTagged) {
+      L.push(`  For the children: ${fmtMoney(t.kids, c)}`);
+      L.push(`  Not for the children: ${fmtMoney(t.not, c)}`);
+      if (t.pending) L.push(`  Not yet tagged: ${fmtMoney(t.review, c)} (${t.pending} item(s))`);
+    }
     L.push("");
   }
-  const unreviewed = active.filter((r) => !r.reviewed).length;
-  if (unreviewed) L.push(`Note: ${unreviewed} receipt(s) not yet marked as reviewed.`, "");
-  L.push("Tags: [KIDS] counted in full, [SPLIT n%] counted at n%, [NOT] excluded, [?] not yet reviewed.");
-  L.push("Tax and receipt-level discounts are shared out in proportion to the item amounts.");
-  L.push("");
+
+  const byMonth = {};
+  const byStore = {};
+  for (const r of active) {
+    const c = curOf(r);
+    const m = `${(r.date || "no date").slice(0, 7)}|${c}`;
+    byMonth[m] = (byMonth[m] || 0) + receiptTotal(r);
+    const st = `${r.store_name || "Unknown"}|${c}`;
+    byStore[st] = (byStore[st] || 0) + receiptTotal(r);
+  }
+  const section = (title, obj, sort) => {
+    const rows = Object.entries(obj).sort(sort);
+    if (rows.length < 2) return;
+    L.push(title);
+    for (const [k, v] of rows) { const [name, c] = k.split("|"); L.push(`  ${name}: ${fmtMoney(v, c)}`); }
+    L.push("");
+  };
+  section("BY MONTH", byMonth, (a, b) => a[0].localeCompare(b[0]));
+  section("BY STORE", byStore, (a, b) => b[1] - a[1]);
+
+  const unverified = active.filter((r) => !r.reviewed).length;
+  if (unverified) L.push(`Note: ${unverified} receipt(s) not yet verified against the paper receipt.`, "");
+  if (anyTagged) {
+    L.push("Tags: [KIDS] counted in full, [SPLIT n%] counted at n%, [NOT] excluded, [ ] not tagged yet.");
+    L.push("Tax and receipt-level discounts are shared out in proportion to the item amounts.");
+    L.push("");
+  }
   L.push("RECEIPTS");
   for (const r of active) {
     const a = allocation(r);
     const c = curOf(r);
+    const tagged = isTagged(r);
     L.push("");
-    L.push(`${r.id} | ${r.date || "no date"}${r.time ? ` ${r.time}` : ""} | ${r.store_name || "Unknown store"}`);
-    L.push(`  For children: ${fmtMoney(a.kids, c)} of ${fmtMoney(a.total, c)}${r.reviewed ? "  (reviewed)" : "  (NOT REVIEWED)"}`);
+    L.push(`${r.id} | ${r.date || "no date"}${r.time ? ` ${r.time}` : ""} | ${r.store_name || "Unknown store"} | ${fmtMoney(a.total, c)}${r.reviewed ? " | verified" : ""}`);
+    if (tagged) L.push(`  For the children: ${fmtMoney(a.kids, c)}${a.pending ? ` (${a.pending} item(s) not tagged yet)` : ""}`);
     if (r.payment_method) L.push(`  Paid: ${r.payment_method}`);
     for (const it of r.items) {
-      const tag = it.alloc === "kids" ? "[KIDS]" : it.alloc === "split" ? `[SPLIT ${it.split_pct}%]` : it.alloc === "not" ? "[NOT]" : "[?]";
+      const tag = !tagged ? "-" : it.alloc === "kids" ? "[KIDS]" : it.alloc === "split" ? `[SPLIT ${it.split_pct}%]` : it.alloc === "not" ? "[NOT]" : "[ ]";
       const qty = it.quantity != null && it.quantity !== 1 ? `${fmtQty(it.quantity)} x ` : "";
       L.push(`   ${tag} ${qty}${it.description} = ${fmtNum(it.line_total)}`);
     }
@@ -699,14 +859,14 @@ function csvCell(v) {
 }
 const toCsv = (rows) => "﻿" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
 
-function buildItemsCsv() {
+function buildItemsCsv(list = reportReceipts()) {
   const rows = [[
     "Receipt ID", "Date", "Time", "Store", "Item", "Category", "Qty", "Unit Price", "Line Total",
     "Tag", "Split % for kids", "Kids amount (incl. tax share)", "Claude suggestion",
-    "Receipt total", "Receipt kids total", "Currency", "Payment", "Reviewed", "Voided", "Void reason",
+    "Receipt total", "Receipt kids total", "Currency", "Payment", "Verified", "Voided", "Void reason",
     "Note", "Original file", "SHA-256", "Added at",
   ]];
-  for (const r of reportReceipts()) {
+  for (const r of list) {
     const a = allocation(r);
     for (const it of r.items.length ? r.items : [null]) {
       rows.push([
@@ -728,60 +888,143 @@ function safeName(s) {
   return s.replace(/[^\w.\- ]+/g, "_").slice(0, 80);
 }
 
-function packFiles() {
-  const ids = new Set(reportReceipts().map((r) => r.fileId));
-  return files.filter((f) => ids.has(f.id) && f.blob);
-}
-
 function originalPath(f) {
   const ext = (f.name.match(/\.[a-z0-9]+$/i) || [""])[0] || (f.kind === "pdf" ? ".pdf" : ".jpg");
   const base = safeName(f.name.replace(/\.[a-z0-9]+$/i, ""));
   return `originals/${(f.receiptIds || []).join("+") || f.id}__${base}${ext}`;
 }
 
-async function buildPack() {
-  const pf = packFiles();
+/**
+ * Builds the evidence pack. With full=true it contains every file, receipt and log entry on the
+ * device (a backup that can be restored); otherwise only receipts in the chosen period.
+ */
+async function buildPack({ full = false } = {}) {
+  toast("Building the pack…", 10000);
+  const list = full
+    ? receipts.slice().sort((a, b) => a.id.localeCompare(b.id))
+    : reportReceipts();
+  const ids = new Set(list.map((r) => r.fileId));
+  const pf = files.filter((f) => f.blob && (full ? f.status === "done" || ids.has(f.id) : ids.has(f.id)));
+
+  const stamped = [];
+  for (const f of pf) {
+    const blob = await stampedImage(f);
+    if (blob) stamped.push({ name: `stamped/${stampedName(f)}`, data: blob });
+  }
   const manifest = toCsv([
     ["Path in pack", "Original name", "Receipt IDs", "SHA-256", "Bytes", "Added to app (UTC)", "File last modified"],
     ...pf.map((f) => [originalPath(f), f.name, (f.receiptIds || []).join(" "), f.sha256, f.size, f.addedAt, f.lastModified]),
   ]);
+  const label = full ? "Full backup (all dates)" : periodLabel();
   const data = JSON.stringify({
+    format: "receipt-mailer-pack",
+    version: 2,
+    full,
     exportedAt: new Date().toISOString(),
-    period: periodLabel(),
-    receipts: reportReceipts(),
-    files: pf.map(({ blob, ...meta }) => meta),
+    period: label,
+    seq,
+    receipts: list,
+    files: pf.map(({ blob, ...meta }) => ({ ...meta, packPath: originalPath(meta) })),
+    log: logEntries.map(({ seq: _s, ...e }) => e),
   }, null, 2);
   const readme = [
-    "Evidence pack",
+    full ? "Full backup / evidence pack" : `Evidence pack — ${label}`,
     "",
-    "report.txt    Child expense report (same text as the email).",
-    "items.csv     One row per receipt line with its tag and the amount counted for the children.",
+    "report.txt    Report (same text as the email).",
+    "items.csv     One row per receipt line: tag and the amount counted for the children.",
     "audit-log.csv Every action taken in the app, timestamped (UTC).",
     "manifest.csv  Original files with SHA-256 fingerprints.",
     "originals/    Unmodified original photos/PDFs, named by receipt ID.",
-    "data.json     Full machine-readable data.",
+    "stamped/      Copies of each photo with receipt ID(s) and fingerprint printed underneath,",
+    "              for printing. The originals/ files are the evidence; these are for convenience.",
+    "data.json     Full machine-readable data (used by Restore in the app).",
     "",
     "To check a file is unchanged, compute its SHA-256 (e.g. `shasum -a 256 file` on Mac,",
     "`certutil -hashfile file SHA256` on Windows) and compare with manifest.csv.",
   ].join("\n");
+
+  // The report covers the period, or everything for a full backup.
+  const savedFrom = $("#periodFrom").value;
+  const savedTo = $("#periodTo").value;
+  if (full) { $("#periodFrom").value = ""; $("#periodTo").value = ""; }
+  const report = buildReport();
+  $("#periodFrom").value = savedFrom;
+  $("#periodTo").value = savedTo;
+
   const zip = await makeZip([
     { name: "README.txt", data: readme },
-    { name: "report.txt", data: buildReport() },
-    { name: "items.csv", data: buildItemsCsv() },
+    { name: "report.txt", data: report },
+    { name: "items.csv", data: buildItemsCsv(list) },
     { name: "audit-log.csv", data: buildLogCsv() },
     { name: "manifest.csv", data: manifest },
     { name: "data.json", data },
     ...pf.map((f) => ({ name: originalPath(f), data: f.blob })),
+    ...stamped,
   ]);
   const stamp = new Date().toISOString().slice(0, 10);
-  await log("exported", "", `evidence pack, ${periodLabel()}, ${reportReceipts().length} receipts, ${pf.length} files`);
-  return new File([zip], `child-expenses-${stamp}.zip`, { type: "application/zip" });
+  await log(full ? "backup_exported" : "exported", "", `${label}, ${list.length} receipts, ${pf.length} files`);
+  if (full) store.set("lastBackup", new Date().toISOString());
+  toast("Pack ready.");
+  return new File([zip], `${full ? "receipts-backup" : "child-expenses"}-${stamp}.zip`, { type: "application/zip" });
+}
+
+/** Restores (merges) a pack made by this app. Existing receipts/files are kept; fingerprints are re-checked. */
+async function restorePack(zipFile) {
+  toast("Reading backup…", 10000);
+  const zip = await readZip(zipFile);
+  const dataName = zip.names.find((n) => n === "data.json" || n.endsWith("/data.json"));
+  if (!dataName) throw new Error("This ZIP isn't a backup from this app (no data.json).");
+  const prefix = dataName.slice(0, -"data.json".length);
+  const data = JSON.parse(await zip.text(dataName));
+  if (!Array.isArray(data.receipts) || !Array.isArray(data.files)) throw new Error("Backup data is unreadable.");
+
+  let addedFiles = 0, addedReceipts = 0, badHash = 0, missing = 0;
+  for (const meta of data.files) {
+    if (files.some((f) => f.id === meta.id || f.sha256 === meta.sha256)) continue;
+    const path = prefix + (meta.packPath || originalPath(meta));
+    const blob = await zip.blob(path, meta.type);
+    if (!blob) { missing += 1; continue; }
+    const hash = await sha256Hex(blob);
+    if (hash !== meta.sha256) { badHash += 1; continue; }
+    const { packPath, ...rest } = meta;
+    const rec = { ...rest, blob, status: "done" };
+    files.push(rec);
+    await saveFile(rec);
+    addedFiles += 1;
+  }
+  for (const r of data.receipts) {
+    if (receipts.some((x) => x.id === r.id)) continue;
+    receipts.push(r);
+    await saveReceipt(r);
+    addedReceipts += 1;
+  }
+  // Bring over log entries we don't have yet (matched on timestamp + action + receipt + detail).
+  const have = new Set(logEntries.map((e) => `${e.ts}|${e.action}|${e.receiptId}|${e.detail}`));
+  for (const e of data.log || []) {
+    const k = `${e.ts}|${e.action}|${e.receiptId}|${e.detail}`;
+    if (have.has(k)) continue;
+    logEntries.push(e);
+    await db.add("log", { ...e });
+  }
+  logEntries.sort((a, b) => a.ts.localeCompare(b.ts));
+  const maxId = Math.max(seq, data.seq || 0, ...receipts.map((r) => Number((r.id.match(/-(\d+)$/) || [])[1] || 0)));
+  if (maxId !== seq) { seq = maxId; await db.put("meta", seq, "seq"); }
+  receipts.sort((a, b) => a.id.localeCompare(b.id));
+
+  const problems = [badHash && `${badHash} file(s) failed the fingerprint check and were skipped`, missing && `${missing} file(s) missing from the ZIP`].filter(Boolean);
+  await log("restored_backup", "", `${zipFile.name}: +${addedReceipts} receipts, +${addedFiles} files${problems.length ? `; ${problems.join("; ")}` : ""}`);
+  render();
+  alert(`Restore complete.\n\nAdded ${addedReceipts} receipt(s) and ${addedFiles} original file(s).${problems.length ? `\n\n⚠ ${problems.join("\n⚠ ")}` : "\nAll fingerprints matched."}`);
 }
 
 function defaultSubject() {
-  const totals = totalsFor(reportReceipts().filter((r) => !r.voided));
-  const amt = Object.entries(totals).map(([c, t]) => fmtMoney(t.kids, c)).join(" + ") || fmtMoney(0, settings.currency);
-  return `Child expenses: ${amt} (${periodLabel()})`;
+  const active = reportReceipts().filter((r) => !r.voided);
+  const totals = totalsFor(active);
+  const pick = active.some(isTagged) ? "kids" : "total";
+  const amt = Object.entries(totals).map(([c, t]) => fmtMoney(t[pick], c)).join(" + ") || fmtMoney(0, settings.currency);
+  return pick === "kids"
+    ? `Child expenses: ${amt} (${periodLabel()})`
+    : `Receipts: ${active.length}, ${amt} (${periodLabel()})`;
 }
 
 async function copyText(text) {
@@ -856,7 +1099,12 @@ function render() {
       onclick: () => removeFile(f.id),
     }, "✕"))));
   const doneCount = files.length - open.length;
-  $("#processedCount").textContent = doneCount ? `${doneCount} file(s) processed, ${receipts.length} receipt(s) on record.` : "";
+  const last = store.get("lastBackup");
+  const days = last ? Math.floor((Date.now() - Date.parse(last)) / 86_400_000) : null;
+  const backupNote = !receipts.length ? ""
+    : last == "" ? " ⚠ Never backed up — Settings → Back up everything."
+    : days >= 7 ? ` ⚠ Last backup ${days} days ago — Settings → Back up everything.` : ` Last backup: ${fmtTs(last)}.`;
+  $("#processedCount").textContent = doneCount ? `${doneCount} file(s) processed, ${receipts.length} receipt(s) on record.${backupNote}` : "";
 
   const pending = files.filter((f) => f.status === "pending" || f.status === "error").length;
   const pb = $("#processBtn");
@@ -871,12 +1119,21 @@ function render() {
   const active = receipts.filter((r) => !r.voided);
   const totals = totalsFor(active);
   const stats = [];
+  const anyTagged = active.some(isTagged);
   for (const [c, t] of Object.entries(totals)) {
-    stats.push([`Kids ${c}`, fmtMoney(t.kids, c), "accent"]);
-    stats.push([`Not kids ${c}`, fmtMoney(t.not, c)]);
-    if (t.pending) stats.push([`To review ${c}`, `${fmtMoney(t.review, c)} · ${t.pending}`]);
+    stats.push([`Spent ${c}`, fmtMoney(t.total, c), anyTagged ? "" : "accent"]);
+    if (anyTagged) {
+      stats.push([`Kids ${c}`, fmtMoney(t.kids, c), "accent"]);
+      stats.push([`Not kids ${c}`, fmtMoney(t.not, c)]);
+      if (t.pending) stats.push([`Untagged ${c}`, fmtMoney(t.review, c)]);
+    }
   }
   stats.push(["Receipts", active.length]);
+
+  const suggestable = receipts.reduce((n, r) => n + suggestableCount(r), 0);
+  const ab = $("#applyAllBtn");
+  ab.hidden = !suggestable;
+  ab.textContent = `✨ Tag ${suggestable} item(s) using Claude's suggestions`;
   $("#totals").replaceChildren(...stats.map(([label, value, cls]) =>
     h("div", { class: `stat ${cls || ""}` }, h("div", { class: "label" }, label), h("div", { class: "value" }, value))));
 
@@ -884,7 +1141,8 @@ function render() {
   const dupes = duplicateIds();
   const counts = {
     all: active.length,
-    review: active.filter((r) => !r.reviewed || allocation(r).pending).length,
+    untagged: active.filter((r) => allocation(r).pending > 0).length,
+    unverified: active.filter((r) => !r.reviewed).length,
     dupe: dupes.size,
     void: receipts.length - active.length,
   };
@@ -899,7 +1157,8 @@ function render() {
     .filter((r) => {
       if (filter === "void") return r.voided;
       if (r.voided) return false;
-      if (filter === "review") return !r.reviewed || allocation(r).pending > 0;
+      if (filter === "untagged") return allocation(r).pending > 0;
+      if (filter === "unverified") return !r.reviewed;
       if (filter === "dupe") return dupes.has(r.id);
       return true;
     })
@@ -924,9 +1183,10 @@ function renderReceipt(r, dupes) {
 
   const badges = [];
   if (r.voided) badges.push(h("span", { class: "badge bad" }, `VOID — ${r.voidReason}`));
-  else if (r.reviewed) badges.push(h("span", { class: "badge ok" }, "Reviewed ✓"));
-  else badges.push(h("span", { class: "badge warn" }, "Not reviewed"));
-  if (a.pending) badges.push(h("span", { class: "badge warn" }, `${a.pending} to tag`));
+  else if (r.reviewed) badges.push(h("span", { class: "badge ok" }, "Verified ✓"));
+  else badges.push(h("span", { class: "badge warn" }, "Not verified"));
+  const tagged = isTagged(r);
+  if (tagged && a.pending) badges.push(h("span", { class: "badge warn" }, `${a.pending} untagged`));
   if (dupes.has(r.id)) badges.push(h("span", { class: "badge bad" }, `Possible duplicate of ${dupes.get(r.id).join(", ")}`));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, `Items+tax = ${fmtNum(expected)} ≠ printed ${fmtNum(r.total)}`));
 
@@ -936,13 +1196,16 @@ function renderReceipt(r, dupes) {
         class: `tag ${it.alloc}`, disabled: r.voided,
         title: `Claude suggested: ${it.ai_suggestion}`,
         onclick: () => setAlloc(r, idx, NEXT_ALLOC[it.alloc]),
-      }, it.alloc === "split" ? `Split` : ALLOC_LABEL[it.alloc]),
+      }, it.alloc === "review" ? "Tag" : ALLOC_LABEL[it.alloc]),
       it.alloc === "split" && h("div", {},
         h("input", {
           class: "pct", type: "number", min: 0, max: 100, step: 1, value: it.split_pct, "aria-label": "Percent for kids",
           onchange: (e) => setSplit(r, idx, e.target.value),
         }), "%")),
-    h("td", { class: "desc" }, it.description, it.quantity != null && it.quantity !== 1 ? h("div", { class: "meta" }, `${fmtQty(it.quantity)} × ${fmtNum(it.unit_price)}`) : null),
+    h("td", { class: "desc" }, it.description,
+      it.quantity != null && it.quantity !== 1 ? h("div", { class: "meta" }, `${fmtQty(it.quantity)} × ${fmtNum(it.unit_price)}`) : null,
+      it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")
+        ? h("div", { class: "suggest" }, `Claude: likely ${it.ai_suggestion === "yes" ? "for kids" : "not for kids"}`) : null),
     h("td", { class: "num" },
       h("button", { class: "amount-btn", disabled: r.voided, title: "Correct amount", onclick: () => editAmount(r, idx) }, fmtNum(it.line_total))),
   ));
@@ -962,7 +1225,9 @@ function renderReceipt(r, dupes) {
         h("div", { class: "meta" }, [r.date || "No date", r.time, r.payment_method].filter(Boolean).join(" · ")),
         h("div", { class: "meta" }, `${r.source} · added ${fmtTs(r.addedAt)} · #${r.sha256.slice(0, 8)}`))),
     h("div", { class: "badges" }, badges),
-    h("div", { class: "kids-line" }, "For kids: ", h("b", {}, fmtMoney(a.kids, c)), ` of ${fmtMoney(a.total, c)}`),
+    tagged
+      ? h("div", { class: "kids-line" }, "For kids: ", h("b", {}, fmtMoney(a.kids, c)), ` of ${fmtMoney(a.total, c)}`)
+      : h("div", { class: "kids-line" }, "Total: ", h("b", {}, fmtMoney(a.total, c)), h("span", { class: "meta" }, " · not separated yet")),
     r.note && h("div", { class: "meta" }, `📝 ${r.note}`),
     r.notes && h("div", { class: "meta" }, `Reading note: ${r.notes}`),
     h("div", { class: "table-wrap" },
@@ -974,12 +1239,22 @@ function renderReceipt(r, dupes) {
             h("td", { class: "num" }, fmtMoney(a.total, c)))))),
     h("div", { class: "actions" },
       h("button", { class: "btn small", onclick: () => viewOriginal(r) }, "View original"),
-      !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "kids") }, "All kids"),
-      !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "not") }, "None kids"),
+      fileOf(r)?.kind === "image" && h("button", { class: "btn small", onclick: () => saveStamped(r) }, "Stamped copy"),
       !r.voided && h("button", { class: "btn small", onclick: () => editNote(r) }, "Note"),
-      !r.voided && h("button", { class: "btn small", onclick: () => editReceipt(r) }, "Fix details"),
-      !r.voided && h("button", { class: `btn small ${r.reviewed ? "" : "primary"}`, onclick: () => toggleReviewed(r) }, r.reviewed ? "Unmark reviewed" : "Mark reviewed"),
-      h("button", { class: "btn small ghost danger", onclick: () => toggleVoid(r) }, r.voided ? "Restore" : "Void")),
+      !r.voided && h("button", {
+        class: `btn small ${r.reviewed ? "" : "primary"}`, title: "You checked the amounts against the paper receipt",
+        onclick: () => toggleReviewed(r),
+      }, r.reviewed ? "Unverify" : "Mark verified")),
+    h("details", { class: "more" },
+      h("summary", {}, "More…"),
+      h("div", { class: "actions" },
+        h("button", { class: "btn small", onclick: () => saveOriginal(r) }, "Save original to Photos/Files"),
+        !r.voided && suggestableCount(r) > 0 && h("button", { class: "btn small", onclick: () => applySuggestions(r) }, "✨ Apply Claude's tags"),
+        !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "kids") }, "All kids"),
+        !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "not") }, "None kids"),
+        !r.voided && tagged && h("button", { class: "btn small", onclick: () => setAll(r, "review") }, "Clear tags"),
+        !r.voided && h("button", { class: "btn small", onclick: () => editReceipt(r) }, "Fix details"),
+        h("button", { class: "btn small ghost danger", onclick: () => toggleVoid(r) }, r.voided ? "Restore" : "Void"))),
   );
 }
 
@@ -993,6 +1268,7 @@ function openSettings() {
   $("#defaultCurrency").value = store.get("defaultCurrency");
   $("#kidsContext").value = settings.kidsContext;
   $("#splitDefault").value = store.get("splitDefault");
+  $("#autoTag").checked = settings.autoTag;
   $("#settingsDialog").showModal();
 }
 
@@ -1004,6 +1280,7 @@ $("#settingsDialog").addEventListener("close", () => {
   store.set("defaultCurrency", $("#defaultCurrency").value.trim().toUpperCase());
   store.set("kidsContext", $("#kidsContext").value.trim());
   store.set("splitDefault", $("#splitDefault").value.trim());
+  store.set("autoTag", $("#autoTag").checked ? "1" : "");
   if (!$("#emailTo").value) $("#emailTo").value = settings.defaultEmail;
   toast("Settings saved.");
   render();
@@ -1045,6 +1322,18 @@ dz.addEventListener("drop", (e) => {
 });
 
 $("#processBtn").addEventListener("click", processAll);
+$("#applyAllBtn").addEventListener("click", applyAllSuggestions);
+$("#backupBtn").addEventListener("click", async () => {
+  try { await shareOrDownload(await buildPack({ full: true }), "Receipts backup"); render(); }
+  catch (err) { console.error(err); toast("Couldn't build the backup."); }
+});
+$("#restoreInput").addEventListener("change", async (e) => {
+  const f = e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  $("#settingsDialog").close("cancel");
+  try { await restorePack(f); } catch (err) { console.error(err); alert(`Restore failed: ${err.message}`); }
+});
 document.querySelectorAll(".chip-filter").forEach((b) => b.addEventListener("click", () => { filter = b.dataset.filter; render(); }));
 $("#search").addEventListener("input", (e) => { query = e.target.value.trim(); render(); });
 $("#periodFrom").addEventListener("change", render);

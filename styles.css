@@ -193,3 +193,14 @@ tr.not-kids td.desc { color: var(--muted); text-decoration: line-through; }
 .stat.accent { background: color-mix(in srgb, var(--accent) 18%, var(--bg)); }
 hr { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
 td.tagcell { width: 1%; white-space: nowrap; vertical-align: top; }
+.check { display: flex; gap: 10px; align-items: flex-start; margin: 4px 0 12px; font-size: .9rem; }
+.check input { width: 20px; height: 20px; margin-top: 2px; accent-color: var(--accent); flex: none; }
+.check small { color: var(--muted); }
+.settings h3 { font-size: .95rem; margin: 0 0 4px; }
+.tag.review { color: var(--muted); border-color: var(--border); border-style: dashed; }
+.suggest { font-size: .75rem; color: var(--muted); }
+.more { margin-top: 6px; }
+.more summary { cursor: pointer; font-size: .85rem; color: var(--muted); padding: 4px 0; }
+#applyAllBtn { margin-bottom: 10px; width: 100%; }
+main > *, .card > * { min-width: 0; }
+.filters { max-width: 100%; }

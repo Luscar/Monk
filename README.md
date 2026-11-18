@@ -33,11 +33,15 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 
 - **Permanent receipt IDs** (`R-2026-0001`, …) that are never reused. Refer to them in emails and spreadsheets.
 - **Originals kept unmodified** on the device with a **SHA-256 fingerprint** and the time each file was added. Adding the same file twice is blocked.
-- **Item-level tags**: each line is *Kids*, *Split n%*, *Not kids* or *Review?*. Claude suggests a tag (you can describe the children in Settings), and you confirm it. Tax and receipt discounts are shared out in proportion to the item amounts.
+- **Collect first, separate later.** By default receipts come in untagged and the app simply totals your spending (by month and store). Claude's kids/not-kids guess is saved on every line. When you're ready, one tap ("✨ Tag N items using Claude's suggestions", or per receipt) applies it, and lines Claude was unsure about (e.g. groceries) stay untagged for you to decide. To tag automatically from the start, turn it on in Settings.
+- **Item-level tags**: each line is *Kids*, *Split n%*, *Not kids* or untagged. You can describe the children in Settings to improve Claude's suggestions.
+- **Verified** marks a receipt whose amounts you've checked against the paper. It's independent of tagging. Tax and receipt discounts are shared out in proportion to the item amounts.
 - **Corrections** to amounts, store, date and total, plus **notes** (e.g. which child, why).
 - **Audit log** of every action with UTC timestamps. Receipts are **voided with a reason, never deleted**, so they stay visible in the report.
 - **Possible-duplicate warning** (same store + date + total).
-- **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json` and `originals/` named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
+- **Stamped copies** of each photo with a banner printed underneath: receipt ID(s), store, date, total, the original's file name, the date it was added, and its SHA-256 fingerprint. Share one to save it to Photos or print it; the untouched original is always kept separately. *Save original to Photos/Files* is under "More…".
+- **Full backup & restore** (Settings): one .zip with everything. Restoring on a new phone re-checks every fingerprint, merges without duplicates, and carries on with the ID numbering. The app reminds you when the last backup is more than 7 days old.
+- **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json`, `originals/` and `stamped/`, named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
 
 ## Notes
 

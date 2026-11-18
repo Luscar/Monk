@@ -73,3 +73,51 @@ export async function makeZip(entries) {
   end.setUint32(16, offset, true);
   return new Blob([...parts, ...central, end], { type: "application/zip" });
 }
+
+/**
+ * Reads a ZIP (stored or deflated entries; no ZIP64). Returns helpers to get entries by name.
+ * @param {Blob} blob
+ */
+export async function readZip(blob) {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error("Not a ZIP file.");
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const dec = new TextDecoder();
+  const entries = new Map();
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) throw new Error("The ZIP file is damaged.");
+    const method = dv.getUint16(p + 10, true);
+    const csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true);
+    const elen = dv.getUint16(p + 30, true);
+    const clen = dv.getUint16(p + 32, true);
+    const off = dv.getUint32(p + 42, true);
+    const name = dec.decode(buf.subarray(p + 46, p + 46 + nlen));
+    p += 46 + nlen + elen + clen;
+    const start = off + 30 + dv.getUint16(off + 26, true) + dv.getUint16(off + 28, true);
+    entries.set(name, { method, raw: buf.subarray(start, start + csize) });
+  }
+  return {
+    names: [...entries.keys()],
+    async blob(name, type = "") {
+      const e = entries.get(name);
+      if (!e) return null;
+      if (e.method === 0) return new Blob([e.raw], { type });
+      if (e.method === 8) {
+        const stream = new Blob([e.raw]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+        return new Blob([await new Response(stream).arrayBuffer()], { type });
+      }
+      throw new Error(`Unsupported compression in ${name}.`);
+    },
+    async text(name) {
+      const b = await this.blob(name);
+      return b ? b.text() : null;
+    },
+  };
+}

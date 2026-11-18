@@ -56,12 +56,14 @@
     </section>
 
     <section class="card" id="resultsCard" hidden>
-      <h2>2. Tag &amp; review</h2>
-      <p class="hint">Tap the tag on each line to switch between <b>Kids</b>, <b>Split</b> (enter %), and <b>Not kids</b>. Tags start as Claude's suggestion, and every change is logged.</p>
+      <h2>2. Your receipts</h2>
+      <p class="hint">Just collecting? Nothing else to do. When you want to separate the kids' share, tap <b>Tag</b> on a line to cycle <b>Kids → Split % → Not kids</b>, or use Claude's suggestions below. Every change is logged.</p>
       <div id="totals" class="totals"></div>
+      <button id="applyAllBtn" class="btn small" hidden></button>
       <div class="filters" role="tablist">
         <button class="chip-filter" data-filter="all">All</button>
-        <button class="chip-filter" data-filter="review">Needs review</button>
+        <button class="chip-filter" data-filter="untagged">Untagged</button>
+        <button class="chip-filter" data-filter="unverified">Not verified</button>
         <button class="chip-filter" data-filter="dupe">Possible duplicates</button>
         <button class="chip-filter" data-filter="void">Voided</button>
       </div>
@@ -94,7 +96,7 @@
         <button id="csvBtn" class="btn">Download CSV</button>
         <button id="copyBtn" class="btn">Copy report</button>
       </div>
-      <p class="hint">The evidence pack contains the report, an item-level CSV, the audit log, a fingerprint manifest and every original file renamed by receipt ID. It also works as your backup.</p>
+      <p class="hint">The evidence pack holds the report, an item-level CSV, the audit log, a fingerprint manifest, every original file, and a stamped copy of each photo (receipt ID + fingerprint printed on it), all named by receipt ID. It covers the dates above. For a full backup, use Settings.</p>
       <details class="preview">
         <summary>Preview report</summary>
         <pre id="emailPreview"></pre>
@@ -133,10 +135,24 @@
         <span>Your currency (used when a receipt doesn't show one)</span>
         <input id="defaultCurrency" type="text" maxlength="3" placeholder="USD">
       </label>
+      <label class="check">
+        <input id="autoTag" type="checkbox">
+        <span>Tag kids' items automatically with Claude's suggestions<br><small>Leave off if you just want to collect for now. Suggestions are saved either way and can be applied later.</small></span>
+      </label>
       <p class="hint">Your key is saved in this browser only. Use a key with a spend limit.</p>
       <div class="row">
         <button value="save" class="btn primary">Save</button>
         <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
+      </div>
+      <hr>
+      <h3>Backup</h3>
+      <p class="hint">Everything lives only on this device. Back up regularly (e.g. email it to yourself or save it to iCloud/Google Drive). A backup can be restored on a new phone, and the fingerprints are re-checked when it is.</p>
+      <div class="row wrap">
+        <button type="button" id="backupBtn" class="btn">Back up everything (.zip)</button>
+        <label class="btn">
+          <input id="restoreInput" type="file" accept=".zip,application/zip" hidden>
+          Restore from backup…
+        </label>
       </div>
       <hr>
       <button type="button" id="wipeBtn" class="btn ghost danger">Erase all data on this device…</button>
