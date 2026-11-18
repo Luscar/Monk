@@ -85,7 +85,7 @@ const RECEIPT_SCHEMA = {
           tax: nullable("number"),
           tip: nullable("number"),
           total: nullable("number"),
-          notes: { ...nullable("string"), description: "At most 2 short sentences: illegible parts, assumptions, or mismatches" },
+          notes: { ...nullable("string"), description: "null unless something affects the amounts, date or legibility; then one short sentence (max ~20 words)" },
           document_type: {
             type: "string",
             enum: ["receipt", "invoice", "other"],
@@ -106,8 +106,9 @@ Rules:
 - Dates must be YYYY-MM-DD. Resolve ambiguous day/month order using the store's country or currency when possible, and mention any ambiguity in notes.
 - Use null for any field that is not printed or not legible. Never invent values.
 - If the printed total does not match the sum of items plus tax, keep the printed values and explain in notes.
+- Discounts printed as their own lines (e.g. "LIQUIDATION -132,00") go in items as negative line totals, directly below the item they apply to. Use the discount field only for a discount that is NOT listed as an item line; otherwise discount is null.
 - date is the transaction or invoice date printed on the document, never today's date. Use null if none is printed.
-- Keep notes brief (at most 2 short sentences, or null when there is nothing worth flagging). Don't restate amounts already captured in other fields.
+- notes: null in the normal case. Only write a note when something could change how the amounts, date or store should be read (ambiguous date, illegible amount, total that doesn't add up, a second receipt cut off in the photo). Then ONE short sentence, max ~20 words. Never restate amounts, taxes, addresses, tracking numbers or other details already captured or not needed, and don't guess who an item is for (that's what likely_for_children is for).
 - document_type: "receipt" if it shows a completed payment (e.g. paid, card approved, change given); "invoice" for a bill, amount due, quote or statement without proof of payment; otherwise "other".
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
 - If the file contains no receipt at all, return an empty receipts array.`;
@@ -435,10 +436,33 @@ async function processAll() {
 // ---------------------------------------------------------------------------
 // Child-expense math
 // ---------------------------------------------------------------------------
+/**
+ * Lines as they count: a discount line (negative amount, e.g. "LIQUIDATION -132,00") follows the tag
+ * of the item just above it, so a rebate on a kids' item reduces the kids' share, not the adult's.
+ */
+function effectiveItems(r) {
+  let prev = null;
+  return (r.items || []).map((it) => {
+    if ((it.line_total || 0) < 0 && prev) return { ...it, alloc: prev.alloc, split_pct: prev.split_pct, linked: true };
+    if ((it.line_total || 0) >= 0) prev = it;
+    return it;
+  });
+}
+
+/**
+ * Receipt-level discount that is NOT already listed as negative item lines.
+ * (Claude sometimes reports both the rebate lines and their sum in `discount`.)
+ */
+function extraDiscount(r) {
+  if (!r.discount) return 0;
+  const listed = -(r.items || []).filter((it) => (it.line_total || 0) < 0).reduce((s, it) => s + it.line_total, 0);
+  return Math.abs(listed - Math.abs(r.discount)) < 0.05 ? 0 : Math.abs(r.discount);
+}
+
 function receiptTotal(r) {
   if (r.total != null) return r.total;
   const itemsSum = (r.items || []).reduce((s, it) => s + (it.line_total || 0), 0);
-  return itemsSum + (r.tax || 0) + (r.tip || 0) - (r.discount || 0);
+  return itemsSum + (r.tax || 0) + (r.tip || 0) - extraDiscount(r);
 }
 
 /**
@@ -447,8 +471,9 @@ function receiptTotal(r) {
  */
 function allocation(r) {
   const total = receiptTotal(r);
+  const items = effectiveItems(r);
   let sum = 0, kids = 0, not = 0, review = 0;
-  for (const it of r.items || []) {
+  for (const it of items) {
     const v = it.line_total || 0;
     sum += v;
     if (it.alloc === "kids") kids += v;
@@ -463,10 +488,11 @@ function allocation(r) {
   return {
     total,
     factor,
+    items,
     kids: round2(kids * factor),
     not: round2(not * factor),
     review: round2(review * factor),
-    pending: (r.items || []).filter((i) => i.alloc === "review").length,
+    pending: items.filter((i) => i.alloc === "review" && !i.linked).length,
   };
 }
 
@@ -506,7 +532,7 @@ function totalsFor(list) {
   return byCur;
 }
 
-const isTagged = (r) => r.items.some((i) => i.alloc !== "review");
+const isTagged = (r) => effectiveItems(r).some((i) => !i.linked && i.alloc !== "review");
 
 // ---------------------------------------------------------------------------
 // Edits (all logged)
@@ -622,13 +648,13 @@ function applySuggestionsTo(r) {
   let n = 0;
   for (const it of r.items) {
     const to = SUGGESTION_TO_ALLOC[it.ai_suggestion];
-    if (it.alloc === "review" && to && to !== "review") { it.alloc = to; n += 1; }
+    if ((it.line_total || 0) >= 0 && it.alloc === "review" && to && to !== "review") { it.alloc = to; n += 1; }
   }
   return n;
 }
 
 const suggestableCount = (r) => r.voided ? 0
-  : r.items.filter((it) => it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")).length;
+  : r.items.filter((it) => (it.line_total || 0) >= 0 && it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")).length;
 
 async function applySuggestions(r) {
   const n = applySuggestionsTo(r);
@@ -785,6 +811,12 @@ function periodLabel() {
   return t("r.range", { from: from || t("r.start"), to: to || t("r.today") });
 }
 
+/** First sentence of Claude's note, capped, for the report (the full note is in the Excel file). */
+function shortNote(n) {
+  const first = String(n).split(/(?<=[.!?])\s+/)[0];
+  return first.length > 140 ? `${first.slice(0, 137).trimEnd()}…` : first;
+}
+
 function buildReport() {
   const list = reportReceipts();
   const active = list.filter((r) => !r.voided);
@@ -845,8 +877,9 @@ function buildReport() {
     if (tagged) L.push(t("r.kidsLine", { t: fmtMoney(a.kids, c) }) + (a.pending ? t("r.kidsPending", { n: a.pending }) : ""));
     if (r.document_type === "invoice") L.push(t("r.invoice"));
     if (r.payment_method) L.push(t("r.paid", { p: r.payment_method }));
-    for (const it of r.items) {
+    for (const it of a.items) {
       const tag = !tagged ? "-"
+        : it.linked ? "  ↳"
         : it.alloc === "kids" ? t("r.tagKids")
         : it.alloc === "split" ? t("r.tagSplit", { p: it.split_pct })
         : it.alloc === "not" ? t("r.tagNot") : "[ ]";
@@ -855,12 +888,12 @@ function buildReport() {
     }
     const extra = [
       r.tax != null && t("r.tax", { v: fmtNum(r.tax) }),
-      r.discount && t("r.discount", { v: fmtNum(r.discount) }),
+      extraDiscount(r) && t("r.discount", { v: fmtNum(extraDiscount(r)) }),
       r.tip && t("r.tip", { v: fmtNum(r.tip) }),
     ].filter(Boolean);
     if (extra.length) L.push(`   (${extra.join(", ")})`);
     if (r.note) L.push(t("r.note", { n: r.note }));
-    if (r.notes) L.push(t("r.readingNote", { n: r.notes }));
+    if (r.notes) L.push(t("r.readingNote", { n: shortNote(r.notes) }));
     if (dupes.has(r.id)) L.push(t("r.dupe", { ids: dupes.get(r.id).join(", ") }));
     L.push(t("r.original", { name: r.source, sha: r.sha256.slice(0, 16), ts: fmtTs(r.addedAt) }));
   }
@@ -888,10 +921,10 @@ function itemRows(list) {
   const rows = [t("csv.items")];
   for (const r of list) {
     const a = allocation(r);
-    for (const it of r.items.length ? r.items : [null]) {
+    for (const it of a.items.length ? a.items : [null]) {
       rows.push([
         r.id, r.date, r.time, r.store_name, docLabel(r), it?.description, it?.category, it?.quantity, it?.unit_price, it?.line_total,
-        it ? ALLOC_LABEL[it.alloc] : "", it?.alloc === "split" ? it.split_pct : "", it ? itemKidsAmount(it, a.factor) : "",
+        it ? `${it.linked ? "↳ " : ""}${ALLOC_LABEL[it.alloc]}` : "", it?.alloc === "split" ? it.split_pct : "", it ? itemKidsAmount(it, a.factor) : "",
         it?.ai_suggestion ? t(`sug.${it.ai_suggestion}`) : "", a.total, a.kids, curOf(r), r.payment_method, yesNo(r.reviewed),
         yesNo(r.voided), r.voidReason, r.note, r.source, r.sha256, r.addedAt,
       ]);
@@ -978,13 +1011,19 @@ async function buildPack({ full = false } = {}) {
   const savedFrom = $("#periodFrom").value;
   const savedTo = $("#periodTo").value;
   if (full) { $("#periodFrom").value = ""; $("#periodTo").value = ""; }
-  const report = buildReport();
-  $("#periodFrom").value = savedFrom;
-  $("#periodTo").value = savedTo;
+  let report, pdf;
+  try {
+    report = buildReport();
+    pdf = await buildPdf(list);
+  } finally {
+    $("#periodFrom").value = savedFrom;
+    $("#periodTo").value = savedTo;
+  }
 
   const zip = await makeZip([
     { name: "README.txt", data: readme },
     { name: "report.txt", data: report },
+    { name: `${t("pdf.file")}.pdf`, data: pdf },
     { name: `${t("xl.file")}.xlsx`, data: await buildXlsx(list) },
     { name: "items.csv", data: buildItemsCsv(list) },
     { name: "audit-log.csv", data: buildLogCsv() },
@@ -1049,6 +1088,304 @@ async function restorePack(zipFile) {
   alert(t("a.restoreDone", { r: addedReceipts, f: addedFiles }) + (problems.length ? `\n\n⚠ ${problems.join("\n⚠ ")}` : `\n${t("a.allMatched")}`));
 }
 
+// ---------------------------------------------------------------------------
+// Short email summary + detailed PDF report
+// ---------------------------------------------------------------------------
+function monthRows(active) {
+  const m = {};
+  for (const r of active) {
+    const k = `${(r.date || "????-??").slice(0, 7)}|${curOf(r)}`;
+    const a = allocation(r);
+    m[k] ??= { kids: 0, total: 0, n: 0 };
+    m[k].kids += a.kids; m[k].total += a.total; m[k].n += 1;
+  }
+  return Object.entries(m).sort((x, y) => x[0].localeCompare(y[0]))
+    .map(([k, v]) => { const [month, c] = k.split("|"); return { month, c, ...v }; });
+}
+
+/** Things a reader should know before relying on the totals. */
+function checkLines(list) {
+  const active = list.filter((r) => !r.voided);
+  const dupes = duplicateIds();
+  const invoices = active.filter((r) => r.document_type === "invoice");
+  const dupIds = active.filter((r) => dupes.has(r.id)).map((r) => r.id);
+  const out = [];
+  const unverified = active.filter((r) => !r.reviewed).length;
+  if (unverified) out.push(t("chk.unverified", { n: unverified }));
+  if (invoices.length) out.push(t("chk.invoice", { n: invoices.length, ids: invoices.map((r) => r.id).join(", ") }));
+  if (dupIds.length) out.push(t("chk.dupe", { ids: dupIds.join(", ") }));
+  const noDate = active.filter((r) => !r.date).length;
+  if (noDate) out.push(t("chk.noDate", { n: noDate }));
+  const voided = list.length - active.length;
+  if (voided) out.push(t("chk.voided", { n: voided }));
+  return out;
+}
+
+/** The email body: a few lines a person can read on a phone. Details go in the attachments. */
+function buildSummary({ attached = true } = {}) {
+  const list = reportReceipts();
+  const active = list.filter((r) => !r.voided);
+  const totals = totalsFor(active);
+  const anyTagged = active.some(isTagged);
+  const multiCur = Object.keys(totals).length > 1;
+  const L = [t(anyTagged ? "s.titleKids" : "s.title"), t("r.period", { p: periodLabel() }), ""];
+  for (const [c, tot] of Object.entries(totals)) {
+    if (multiCur) L.push(`— ${c} —`);
+    if (anyTagged) L.push(t("s.kids", { t: fmtMoney(tot.kids, c) }));
+    L.push(t("s.total", { t: fmtMoney(tot.total, c), n: tot.count }));
+    if (anyTagged) {
+      L.push(t("s.not", { t: fmtMoney(tot.not, c) }));
+      const untaggedReceipts = active.filter((r) => curOf(r) === c && allocation(r).pending).length;
+      if (tot.pending) L.push(t("s.untagged", { t: fmtMoney(tot.review, c), n: untaggedReceipts }));
+    }
+    L.push("");
+  }
+  const months = monthRows(active);
+  if (months.length) {
+    L.push(t(anyTagged ? "s.byMonthKids" : "s.byMonth"));
+    for (const m of months) {
+      const cur = multiCur ? ` (${m.c})` : "";
+      L.push(anyTagged
+        ? `  ${m.month} : ${fmtMoney(m.kids, m.c)} / ${fmtMoney(m.total, m.c)}${cur}`
+        : `  ${m.month} : ${fmtMoney(m.total, m.c)}${cur}`);
+    }
+    L.push("");
+  }
+  const checks = checkLines(list);
+  if (checks.length) L.push(t("s.checks"), ...checks.map((x) => `  • ${x}`), "");
+  if (attached) L.push(t("s.attached"));
+  return L.join("\n").trim();
+}
+
+// jsPDF's built-in fonts only cover Windows-1252: map/replace anything else.
+const PDF_OK = /[ -~¡-ÿ€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ\n]/;
+function pdfText(v) {
+  return Array.from(String(v ?? "")
+    .replace(/[   ]/g, " ").replace(/≠/g, "<>").replace(/[→↳]/g, "->")
+    .replace(/⚠️?/g, "!").replace(/[✓✔]/g, "").replace(/✨|📝/g, ""))
+    .map((ch) => (PDF_OK.test(ch) ? ch : "?")).join("");
+}
+
+function tagText(it) {
+  if (it.linked) return "->";
+  if (it.alloc === "split") return `${ALLOC_LABEL.split} ${it.split_pct} %`;
+  return it.alloc === "review" ? "—" : ALLOC_LABEL[it.alloc];
+}
+
+/** Detailed, printable report: summary, months, checks, then one section per receipt. */
+async function buildPdf(list = reportReceipts()) {
+  const { jsPDF, autoTable } = await import("./vendor/pdf.js");
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = 40;
+  const INK = [23, 32, 30], MUTED = [93, 107, 104], WARN = [181, 71, 8], ACCENT = [15, 118, 110];
+  let y = M;
+  const ensure = (need) => { if (y + need > H - 50) { doc.addPage(); y = M; } };
+  const text = (str, { size = 10, bold = false, color = INK, gap = 4 } = {}) => {
+    doc.setFont("helvetica", bold ? "bold" : "normal");
+    doc.setFontSize(size);
+    doc.setTextColor(...color);
+    const lines = doc.splitTextToSize(pdfText(str), W - 2 * M);
+    ensure(lines.length * size * 1.25);
+    doc.text(lines, M, y + size);
+    y += lines.length * size * 1.25 + gap;
+  };
+  let colStyles = {};
+  // Header and footer cells don't inherit columnStyles: right-align them like the amounts below.
+  const alignCell = (v, i) => ({ content: pdfText(v), styles: colStyles[i]?.halign ? { halign: colStyles[i].halign } : {} });
+  const table = (opts) => {
+    colStyles = opts.columnStyles || {};
+    autoTable(doc, {
+      startY: y, theme: "grid", margin: { left: M, right: M, bottom: 50 },
+      styles: { fontSize: 8.5, cellPadding: 3, overflow: "linebreak", textColor: INK, lineColor: [221, 227, 225] },
+      headStyles: { fillColor: ACCENT, textColor: 255, fontStyle: "bold" },
+      footStyles: { fillColor: [244, 246, 245], textColor: INK, fontStyle: "bold" },
+      ...opts,
+      head: opts.head?.map((r) => r.map((v, i) => alignCell(v, i))),
+      body: opts.body.map((r) => r.map(pdfText)),
+      foot: opts.foot?.map((r) => r.map((v, i) => alignCell(v, i))),
+    });
+    y = doc.lastAutoTable.finalY + 10;
+  };
+  const right = (cols) => Object.fromEntries(cols.map((i) => [i, { halign: "right" }]));
+
+  const active = list.filter((r) => !r.voided);
+  const voided = list.filter((r) => r.voided);
+  const totals = totalsFor(active);
+  const anyTagged = active.some(isTagged);
+  const dupes = duplicateIds();
+  const title = t(anyTagged ? "s.titleKids" : "s.title");
+
+  text(title, { size: 18, bold: true, gap: 2 });
+  text(`${t("r.period", { p: periodLabel() })}  ·  ${t("r.generated", { ts: fmtTs(new Date().toISOString()) })}  ·  ${t("r.receipts", { n: active.length })}`, { size: 9, color: MUTED, gap: 10 });
+
+  // Totals
+  const curs = Object.entries(totals);
+  if (anyTagged) {
+    table({
+      head: [[t("pdf.cur"), t("pdf.kids"), t("pdf.not"), t("pdf.untagged"), t("pdf.total"), t("pdf.tax")]],
+      body: curs.map(([c, x]) => [c, fmtMoney(x.kids, c), fmtMoney(x.not, c), fmtMoney(x.review, c), fmtMoney(x.total, c), fmtMoney(x.tax, c)]),
+      columnStyles: { ...right([1, 2, 3, 4, 5]), 1: { halign: "right", fontStyle: "bold" } },
+    });
+  } else {
+    table({
+      head: [[t("pdf.cur"), t("pdf.total"), t("pdf.tax"), t("pdf.receipts")]],
+      body: curs.map(([c, x]) => [c, fmtMoney(x.total, c), fmtMoney(x.tax, c), String(x.count)]),
+      columnStyles: right([1, 2, 3]),
+    });
+  }
+
+  // By month
+  const months = monthRows(active);
+  if (months.length > 1) {
+    text(t("r.byMonth"), { size: 11, bold: true });
+    table({
+      head: [anyTagged ? [t("pdf.month"), t("pdf.kids"), t("pdf.total"), t("pdf.receipts")] : [t("pdf.month"), t("pdf.total"), t("pdf.receipts")]],
+      body: months.map((m) => anyTagged
+        ? [m.month, fmtMoney(m.kids, m.c), fmtMoney(m.total, m.c), String(m.n)]
+        : [m.month, fmtMoney(m.total, m.c), String(m.n)]),
+      columnStyles: anyTagged ? right([1, 2, 3]) : right([1, 2]),
+    });
+  }
+
+  // Checks + how to read
+  const checks = checkLines(list);
+  if (checks.length) {
+    text(t("s.checks"), { size: 11, bold: true, gap: 2 });
+    for (const c of checks) text(`•  ${c}`, { size: 9, color: WARN, gap: 1 });
+    y += 8;
+  }
+  if (anyTagged) text(`${t("pdf.legend")} ${t("r.legend2")}`, { size: 8, color: MUTED, gap: 1 });
+  text(t("r.dateLegend"), { size: 8, color: MUTED, gap: 12 });
+
+  // One section per receipt
+  text(t("r.receiptsHdr"), { size: 13, bold: true, gap: 6 });
+  for (const r of active) {
+    const a = allocation(r);
+    const c = curOf(r);
+    const tagged = isTagged(r);
+    ensure(110);
+    doc.setDrawColor(221, 227, 225);
+    doc.line(M, y, W - M, y);
+    y += 6;
+    text(`${r.id}   ${r.date || t("r.noDate")}${r.time ? ` ${r.time}` : ""}   ${r.store_name || t("unknownStore")}`, { size: 11, bold: true, gap: 1 });
+    const meta = [
+      `${t("total")} ${fmtMoney(a.total, c)}`,
+      tagged && `${t("pdf.kids")} ${fmtMoney(a.kids, c)}`,
+      r.payment_method,
+      r.reviewed ? t("badge.verified") : t("badge.unverified"),
+    ].filter(Boolean);
+    text(meta.join("   ·   "), { size: 9, color: MUTED, gap: 2 });
+    const flags = [
+      r.document_type === "invoice" && t("badge.invoice"),
+      dupes.has(r.id) && t("badge.dupe", { ids: dupes.get(r.id).join(", ") }),
+    ].filter(Boolean);
+    if (flags.length) text(flags.join("   ·   "), { size: 9, color: WARN, gap: 2 });
+
+    const foot = [
+      r.tax != null && [t("tax"), fmtNum(r.tax)],
+      extraDiscount(r) && [t("discount"), `-${fmtNum(extraDiscount(r))}`],
+      r.tip && [t("tip"), fmtNum(r.tip)],
+      [t("total"), fmtMoney(a.total, c)],
+    ].filter(Boolean);
+    const qty = (it) => (it.quantity != null && it.quantity !== 1 ? fmtQty(it.quantity) : "");
+    if (tagged) {
+      table({
+        head: [[t("pdf.tag"), t("pdf.item"), t("pdf.qty"), t("pdf.amount"), t("pdf.kidsPart")]],
+        body: a.items.map((it) => [tagText(it), it.description, qty(it), fmtNum(it.line_total), fmtNum(itemKidsAmount(it, a.factor))]),
+        foot: foot.map(([k, v], i) => ["", k, "", v, i === foot.length - 1 ? fmtMoney(a.kids, c) : ""]),
+        showFoot: "lastPage",
+        columnStyles: { 0: { cellWidth: 72 }, 2: { cellWidth: 32, halign: "right" }, 3: { cellWidth: 62, halign: "right" }, 4: { cellWidth: 72, halign: "right" } },
+      });
+    } else {
+      table({
+        head: [[t("pdf.item"), t("pdf.qty"), t("pdf.amount")]],
+        body: a.items.map((it) => [it.description, qty(it), fmtNum(it.line_total)]),
+        foot: foot.map(([k, v]) => [k, "", v]),
+        showFoot: "lastPage",
+        columnStyles: { 1: { cellWidth: 32, halign: "right" }, 2: { cellWidth: 72, halign: "right" } },
+      });
+    }
+    y -= 4;
+    if (r.note) text(t("r.note", { n: r.note }).trim(), { size: 9, gap: 1 });
+    if (r.notes) text(t("r.readingNote", { n: shortNote(r.notes) }).trim(), { size: 8.5, color: MUTED, gap: 1 });
+    text(t("pdf.original", { name: r.source, sha: r.sha256.slice(0, 16), ts: fmtTs(r.addedAt) }), { size: 7.5, color: MUTED, gap: 14 });
+  }
+
+  if (voided.length) {
+    ensure(80);
+    text(t("r.voidedHdr"), { size: 11, bold: true });
+    table({
+      head: [[t("pdf.id"), t("pdf.date"), t("pdf.store"), t("pdf.total"), t("pdf.voidReason")]],
+      body: voided.map((r) => [r.id, r.date || "", r.store_name || "", fmtMoney(receiptTotal(r), curOf(r)), r.voidReason || ""]),
+      columnStyles: { 3: { halign: "right" } },
+    });
+  }
+  text(t("r.footer"), { size: 8, color: MUTED });
+
+  const pages = doc.getNumberOfPages();
+  for (let i = 1; i <= pages; i++) {
+    doc.setPage(i);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(...MUTED);
+    doc.text(pdfText(`${title} — ${periodLabel()}`), M, H - 24);
+    doc.text(pdfText(t("pdf.page", { i, n: pages })), W - M, H - 24, { align: "right" });
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  return new File([doc.output("blob")], `${t("pdf.file")}-${stamp}.pdf`, { type: "application/pdf" });
+}
+
+async function xlsxFile(list) {
+  const blob = await buildXlsx(list);
+  return new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type });
+}
+
+// iOS only lets a page open the share sheet right after a tap. If building the files takes too
+// long, the first tap prepares them and asks for a second tap, which then shares instantly.
+const prepared = new Map();
+const stateKey = () => `${logEntries.length}|${receipts.length}|${$("#periodFrom").value}|${$("#periodTo").value}`;
+
+async function shareFiles(kind, build, { title, text }) {
+  const key = stateKey();
+  let entry = prepared.get(kind);
+  const fresh = entry?.key === key;
+  if (!fresh) {
+    toast(t("t.building"), 15000);
+    entry = { key, files: await build() };
+    prepared.set(kind, entry);
+  }
+  try {
+    if (navigator.canShare?.({ files: entry.files })) {
+      await navigator.share({ title, text, files: entry.files });
+    } else {
+      entry.files.forEach(download);
+      toast(t("t.shareUnsupported"));
+    }
+    toast(t("t.packReady"), 1200);
+    return true;
+  } catch (err) {
+    if (err?.name === "AbortError") return false;
+    if (err?.name === "NotAllowedError" && !fresh) { toast(t("t.tapAgain"), 6000); return false; }
+    console.error(err);
+    toast(t("t.shareFailed"));
+    return false;
+  }
+}
+
+async function shareReport() {
+  const subject = $("#emailSubject").value.trim() || defaultSubject();
+  const ok = await shareFiles("report", async () => {
+    const list = reportReceipts();
+    return [await buildPdf(list), await xlsxFile(list)];
+  }, { title: subject, text: buildSummary({ attached: true }) });
+  if (ok) {
+    await log("shared", "", t("lg.shared", { p: periodLabel(), n: reportReceipts().length }));
+    render();
+  }
+}
+
 function defaultSubject() {
   const active = reportReceipts().filter((r) => !r.voided);
   const totals = totalsFor(active);
@@ -1073,7 +1410,7 @@ function download(file) {
 async function sendEmail() {
   const to = $("#emailTo").value.trim();
   const subject = $("#emailSubject").value.trim() || defaultSubject();
-  const body = buildReport().replace(/\r?\n/g, "\r\n");
+  const body = buildSummary({ attached: false }).replace(/\r?\n/g, "\r\n");
   if (to) store.set("lastEmail", to);
   let url = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   if (url.length > 30000) {
@@ -1090,17 +1427,8 @@ async function sendEmail() {
 
 async function sharePack() {
   const subject = $("#emailSubject").value.trim() || defaultSubject();
-  try {
-    const pack = await buildPack();
-    if (navigator.canShare?.({ files: [pack] })) {
-      await navigator.share({ title: subject, text: buildReport(), files: [pack] });
-    } else {
-      download(pack);
-      toast(t("t.shareUnsupported"));
-    }
-  } catch (err) {
-    if (err?.name !== "AbortError") { console.error(err); toast(t("t.shareFailed")); }
-  }
+  await shareFiles("pack", async () => [await buildPack()], { title: subject, text: buildSummary({ attached: false }) });
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,14 +1531,14 @@ function render() {
     h("div", { class: "log-entry" }, h("time", {}, fmtTs(e.ts)), e.receiptId ? h("b", {}, `${e.receiptId} `) : null, `${actionLabel(e.action)}: ${e.detail}`)));
 
   if (!$("#emailSubject").dataset.edited) $("#emailSubject").value = defaultSubject();
-  $("#emailPreview").textContent = buildReport();
+  $("#emailPreview").textContent = buildSummary({ attached: true });
 }
 
 function renderReceipt(r, dupes) {
   const c = curOf(r);
   const a = allocation(r);
   const itemsSum = r.items.reduce((s, it) => s + (it.line_total || 0), 0);
-  const expected = itemsSum + (r.tax || 0) + (r.tip || 0) - (r.discount || 0);
+  const expected = itemsSum + (r.tax || 0) + (r.tip || 0) - extraDiscount(r);
   const mismatch = r.total != null && Math.abs(expected - r.total) > 0.05 && Math.abs(itemsSum - r.total) > 0.05;
 
   const badges = [];
@@ -1223,21 +1551,21 @@ function renderReceipt(r, dupes) {
   if (r.document_type === "invoice") badges.push(h("span", { class: "badge warn" }, t("badge.invoice")));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, t("badge.mismatch", { a: fmtNum(expected), b: fmtNum(r.total) })));
 
-  const rows = r.items.map((it, idx) => h("tr", { class: it.alloc === "not" ? "not-kids" : "" },
+  const rows = a.items.map((it, idx) => h("tr", { class: it.alloc === "not" ? "not-kids" : "" },
     h("td", { class: "tagcell" },
-      h("button", {
+      it.linked ? h("span", { class: "tag linked", title: t("tag.linked") }, "↳") : h("button", {
         class: `tag ${it.alloc}`, disabled: r.voided,
         title: t("tag.suggested", { s: it.ai_suggestion ? t(`sug.${it.ai_suggestion}`) : "—" }),
         onclick: () => setAlloc(r, idx, NEXT_ALLOC[it.alloc]),
       }, it.alloc === "review" ? t("tag.button") : ALLOC_LABEL[it.alloc]),
-      it.alloc === "split" && h("div", {},
+      it.alloc === "split" && !it.linked && h("div", {},
         h("input", {
           class: "pct", type: "number", min: 0, max: 100, step: 1, value: it.split_pct, "aria-label": t("pct.aria"),
           onchange: (e) => setSplit(r, idx, e.target.value),
         }), "%")),
     h("td", { class: "desc" }, it.description,
       it.quantity != null && it.quantity !== 1 ? h("div", { class: "meta" }, `${fmtQty(it.quantity)} × ${fmtNum(it.unit_price)}`) : null,
-      it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")
+      !it.linked && it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")
         ? h("div", { class: "suggest" }, t(it.ai_suggestion === "yes" ? "suggest.yes" : "suggest.no")) : null),
     h("td", { class: "num" },
       h("button", { class: "amount-btn", disabled: r.voided, title: t("amount.title"), onclick: () => editAmount(r, idx) }, fmtNum(it.line_total))),
@@ -1245,7 +1573,7 @@ function renderReceipt(r, dupes) {
 
   const foot = [
     r.subtotal != null && [t("subtotal"), r.subtotal],
-    r.discount && [t("discount"), -r.discount],
+    extraDiscount(r) && [t("discount"), -extraDiscount(r)],
     r.tax != null && [t("tax"), r.tax],
     r.tip && [t("tip"), r.tip],
   ].filter(Boolean);
@@ -1262,7 +1590,7 @@ function renderReceipt(r, dupes) {
       ? h("div", { class: "kids-line" }, t("forKids"), h("b", {}, fmtMoney(a.kids, c)), t("ofTotal", { t: fmtMoney(a.total, c) }))
       : h("div", { class: "kids-line" }, t("totalLabel"), h("b", {}, fmtMoney(a.total, c)), h("span", { class: "meta" }, t("notSeparated"))),
     r.note && h("div", { class: "meta" }, `📝 ${r.note}`),
-    r.notes && h("div", { class: "meta" }, t("readingNote", { n: r.notes })),
+    r.notes && h("details", { class: "reading-note" }, h("summary", {}, t("readingNoteToggle")), h("p", {}, r.notes)),
     h("div", { class: "table-wrap" },
       h("table", {},
         h("tbody", {}, rows),
@@ -1383,7 +1711,11 @@ $("#periodTo").addEventListener("change", render);
 
 $("#emailSubject").addEventListener("input", (e) => { e.target.dataset.edited = "1"; });
 $("#emailBtn").addEventListener("click", sendEmail);
-$("#shareBtn").addEventListener("click", sharePack);
+$("#shareBtn").addEventListener("click", shareReport);
+$("#packShareBtn").addEventListener("click", sharePack);
+$("#pdfBtn").addEventListener("click", async () => {
+  try { download(await buildPdf()); } catch (err) { console.error(err); toast(t("t.packFail")); }
+});
 $("#zipBtn").addEventListener("click", async () => {
   try { download(await buildPack()); render(); } catch (err) { console.error(err); toast(t("t.packFail")); }
 });
@@ -1392,7 +1724,7 @@ $("#csvBtn").addEventListener("click", async () => {
   download(new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
 });
 $("#copyBtn").addEventListener("click", async () => {
-  toast((await copyText(buildReport())) ? t("t.copied") : t("t.copyFail"));
+  toast((await copyText(buildSummary({ attached: false }))) ? t("t.copied") : t("t.copyFail"));
 });
 
 $("#emailTo").value = store.get("lastEmail") || settings.defaultEmail;

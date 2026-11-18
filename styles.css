@@ -207,3 +207,6 @@ main > *, .card > * { min-width: 0; }
 [hidden] { display: none !important; }
 .two-col > * { min-width: 0; }
 .field input[type="date"] { min-width: 0; max-width: 100%; }
+.reading-note { margin-top: 4px; font-size: .85rem; color: var(--muted); }
+.reading-note summary { cursor: pointer; padding: 2px 0; list-style-position: inside; }
+.reading-note p { margin: 4px 0 0; }

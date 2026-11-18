@@ -90,15 +90,22 @@
         <input id="emailSubject" type="text">
       </label>
       <div class="row wrap">
-        <button id="emailBtn" class="btn primary" data-i18n="btn.email">Open in Mail</button>
-        <button id="shareBtn" class="btn" data-i18n="btn.share">Share evidence pack</button>
-        <button id="zipBtn" class="btn" data-i18n="btn.zip">Download evidence pack (.zip)</button>
-        <button id="csvBtn" class="btn" data-i18n="btn.csv">Download CSV</button>
-        <button id="copyBtn" class="btn" data-i18n="btn.copy">Copy report</button>
+        <button id="shareBtn" class="btn primary" data-i18n="btn.shareReport">Send report (PDF + Excel)</button>
       </div>
+      <details class="more">
+        <summary data-i18n="send.more">More options…</summary>
+        <div class="row wrap">
+        <button id="emailBtn" class="btn" data-i18n="btn.emailPlain">Email (summary only)</button>
+        <button id="pdfBtn" class="btn" data-i18n="btn.pdf">Download PDF</button>
+        <button id="csvBtn" class="btn" data-i18n="btn.csv">Download Excel (.xlsx)</button>
+        <button id="packShareBtn" class="btn" data-i18n="btn.share">Share evidence pack (.zip)</button>
+        <button id="zipBtn" class="btn" data-i18n="btn.zip">Download evidence pack (.zip)</button>
+        <button id="copyBtn" class="btn" data-i18n="btn.copy">Copy summary</button>
+        </div>
+      </details>
       <p class="hint" data-i18n="send.hint"></p>
       <details class="preview">
-        <summary data-i18n="send.preview">Preview report</summary>
+        <summary data-i18n="send.preview">Email preview</summary>
         <pre id="emailPreview"></pre>
       </details>
     </section>
