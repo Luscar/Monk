@@ -85,7 +85,7 @@ const RECEIPT_SCHEMA = {
           tax: nullable("number"),
           tip: nullable("number"),
           total: nullable("number"),
-          notes: { ...nullable("string"), description: "At most 2 short sentences: illegible parts, assumptions, or mismatches" },
+          notes: { ...nullable("string"), description: "null unless something affects the amounts, date or legibility; then one short sentence (max ~20 words)" },
           document_type: {
             type: "string",
             enum: ["receipt", "invoice", "other"],
@@ -107,7 +107,7 @@ Rules:
 - Use null for any field that is not printed or not legible. Never invent values.
 - If the printed total does not match the sum of items plus tax, keep the printed values and explain in notes.
 - date is the transaction or invoice date printed on the document, never today's date. Use null if none is printed.
-- Keep notes brief (at most 2 short sentences, or null when there is nothing worth flagging). Don't restate amounts already captured in other fields.
+- notes: null in the normal case. Only write a note when something could change how the amounts, date or store should be read (ambiguous date, illegible amount, total that doesn't add up, a second receipt cut off in the photo). Then ONE short sentence, max ~20 words. Never restate amounts, taxes, addresses, tracking numbers or other details already captured or not needed, and don't guess who an item is for (that's what likely_for_children is for).
 - document_type: "receipt" if it shows a completed payment (e.g. paid, card approved, change given); "invoice" for a bill, amount due, quote or statement without proof of payment; otherwise "other".
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
 - If the file contains no receipt at all, return an empty receipts array.`;
@@ -785,6 +785,12 @@ function periodLabel() {
   return t("r.range", { from: from || t("r.start"), to: to || t("r.today") });
 }
 
+/** First sentence of Claude's note, capped, for the report (the full note is in the Excel file). */
+function shortNote(n) {
+  const first = String(n).split(/(?<=[.!?])\s+/)[0];
+  return first.length > 140 ? `${first.slice(0, 137).trimEnd()}…` : first;
+}
+
 function buildReport() {
   const list = reportReceipts();
   const active = list.filter((r) => !r.voided);
@@ -860,7 +866,7 @@ function buildReport() {
     ].filter(Boolean);
     if (extra.length) L.push(`   (${extra.join(", ")})`);
     if (r.note) L.push(t("r.note", { n: r.note }));
-    if (r.notes) L.push(t("r.readingNote", { n: r.notes }));
+    if (r.notes) L.push(t("r.readingNote", { n: shortNote(r.notes) }));
     if (dupes.has(r.id)) L.push(t("r.dupe", { ids: dupes.get(r.id).join(", ") }));
     L.push(t("r.original", { name: r.source, sha: r.sha256.slice(0, 16), ts: fmtTs(r.addedAt) }));
   }
@@ -1262,7 +1268,7 @@ function renderReceipt(r, dupes) {
       ? h("div", { class: "kids-line" }, t("forKids"), h("b", {}, fmtMoney(a.kids, c)), t("ofTotal", { t: fmtMoney(a.total, c) }))
       : h("div", { class: "kids-line" }, t("totalLabel"), h("b", {}, fmtMoney(a.total, c)), h("span", { class: "meta" }, t("notSeparated"))),
     r.note && h("div", { class: "meta" }, `📝 ${r.note}`),
-    r.notes && h("div", { class: "meta" }, t("readingNote", { n: r.notes })),
+    r.notes && h("details", { class: "reading-note" }, h("summary", {}, t("readingNoteToggle")), h("p", {}, r.notes)),
     h("div", { class: "table-wrap" },
       h("table", {},
         h("tbody", {}, rows),
