@@ -606,8 +606,21 @@ function itemKidsAmount(it, factor) {
 
 const dupKey = (r) => `${(r.store_name || "").toLowerCase().trim()}|${r.date || ""}|${receiptTotal(r).toFixed(2)}`;
 
+/** Active receipts (not made from a statement) with the same total within ±3 days. */
+function sameAmountNearby(amount, date, exceptId) {
+  const day = (d) => (d ? Date.parse(d) / 86400000 : NaN);
+  return receipts.filter((r) => !r.voided && !r.fromStatement && r.id !== exceptId
+    && Math.abs(receiptTotal(r) - amount) < 0.011 && Math.abs(day(r.date) - day(date)) <= 3);
+}
+
 function duplicateIds() {
   const groups = new Map();
+  for (const r of receipts) {
+    if (r.voided || !r.fromStatement) continue;
+    for (const x of sameAmountNearby(receiptTotal(r), r.date, r.id)) {
+      groups.set(`st|${r.id}`, [...new Set([...(groups.get(`st|${r.id}`) || [r.id]), x.id])]);
+    }
+  }
   for (const r of receipts) {
     if (r.voided) continue;
     const k = dupKey(r);
@@ -615,7 +628,7 @@ function duplicateIds() {
   }
   const out = new Map();
   for (const ids of groups.values()) {
-    if (ids.length > 1) ids.forEach((id) => out.set(id, ids.filter((x) => x !== id)));
+    if (ids.length > 1) ids.forEach((id) => out.set(id, [...new Set([...(out.get(id) || []), ...ids.filter((x) => x !== id)])]));
   }
   return out;
 }
@@ -940,6 +953,8 @@ function txUse(tx) {
 }
 
 async function addTxAsExpense(f, tx) {
+  const same = sameAmountNearby(tx.amount, tx.date);
+  if (same.length && !confirm(t("c.txDupe", { ids: same.map((r) => `${r.id} (${r.store_name || ""}, ${r.date || "—"})`).join(", ") }))) return;
   const s = f.statement;
   const r = {
     id: nextReceiptId(),
@@ -1106,7 +1121,6 @@ function buildReport() {
     if (r.payer === "other") L.push(`  ${t("badge.payerOther")}`);
     if (r.declared) L.push(`  ${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
     if (r.paymentProof) L.push(`  ${t("r.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "", amt: fmtNum(r.paymentProof.amount), ref: r.paymentProof.ref || "" })}`);
-    else if (r.document_type === "invoice") L.push(t("r.invoice"));
     if (r.fromStatement) L.push(`  ${t("badge.fromStatement")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
     if (r.payment_method) L.push(t("r.paid", { p: r.payment_method }));
     for (const it of a.items) {
@@ -1374,12 +1388,10 @@ function typeRows(active) {
 function checkLines(list) {
   const active = list.filter((r) => !r.voided);
   const dupes = duplicateIds();
-  const invoices = active.filter((r) => r.document_type === "invoice" && !r.paymentProof);
   const dupIds = active.filter((r) => dupes.has(r.id)).map((r) => r.id);
   const out = [];
   const unverified = active.filter((r) => !r.reviewed).length;
   if (unverified) out.push(t("chk.unverified", { n: unverified }));
-  if (invoices.length) out.push(t("chk.invoice", { n: invoices.length, ids: invoices.map((r) => r.id).join(", ") }));
   if (dupIds.length) out.push(t("chk.dupe", { ids: dupIds.join(", ") }));
   const declared = active.filter((r) => r.declared).length;
   if (declared) out.push(t("chk.declared", { n: declared }));
@@ -1676,7 +1688,6 @@ async function buildPdf(list = reportReceipts()) {
     ].filter(Boolean);
     text(meta.join("   ·   "), { size: 9, color: MUTED, gap: 2 });
     const flags = [
-      !r.paymentProof && r.document_type === "invoice" && t("badge.invoice"),
       r.declared && `${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`,
       dupes.has(r.id) && t("badge.dupe", { ids: dupes.get(r.id).join(", ") }),
     ].filter(Boolean);
@@ -1986,8 +1997,7 @@ function renderTxRows(f) {
     const actions = use
       ? [h("span", { class: `tx-used ${use.type}` }, t(use.type === "proof" ? "st.usedProof" : "st.usedExpense", { id: use.r.id })),
         h("button", { class: "btn small ghost", onclick: () => releaseTx(f, tx) }, t("st.release"))]
-      : [h("button", { class: "btn small", onclick: () => addTxAsExpense(f, tx) }, t("st.addExpense")),
-        h("button", { class: "btn small", onclick: () => { linkOpen = linkOpen === key ? null : key; renderStatements(); } }, t("st.linkProof"))];
+      : [h("button", { class: "btn small", onclick: () => addTxAsExpense(f, tx) }, t("st.addExpense"))];
     let picker = null;
     if (linkOpen === key && !use) {
       const cands = proofCandidates(tx);
@@ -2047,7 +2057,6 @@ function renderReceipt(r, dupes) {
   if (r.declared) badges.push(h("span", { class: "badge warn" }, t("badge.declared")));
   if (r.fromStatement) badges.push(h("span", { class: "badge ok" }, t("badge.fromStatement")));
   if (r.paymentProof) badges.push(h("span", { class: "badge ok" }, t("badge.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "" })));
-  else if (r.document_type === "invoice") badges.push(h("span", { class: "badge warn" }, t("badge.invoice")));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, t("badge.mismatch", { a: fmtNum(expected), b: fmtNum(r.total) })));
 
   const rows = a.items.map((it, idx) => [h("tr", { class: `${it.alloc === "not" ? "not-kids" : ""} ${isKidsLine(it) && !it.linked ? "has-type" : ""}` },
