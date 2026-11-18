@@ -130,6 +130,44 @@ Rules:
 - Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12"). Skip headers, totals, subtotals and empty rows. Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
 - If the file contains no receipt at all, return an empty receipts array.`;
 
+const STATEMENT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["institution", "account_last4", "period_start", "period_end", "currency", "transactions"],
+  properties: {
+    institution: { ...nullable("string"), description: "Bank or card issuer, e.g. Desjardins Visa" },
+    account_last4: { ...nullable("string"), description: "ONLY the last 4 digits of the card/account, never more" },
+    period_start: { ...nullable("string"), description: "YYYY-MM-DD" },
+    period_end: { ...nullable("string"), description: "YYYY-MM-DD" },
+    currency: { type: "string", description: "ISO 4217 code" },
+    transactions: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["date", "description", "amount", "ref"],
+        properties: {
+          date: { ...nullable("string"), description: "Transaction date YYYY-MM-DD" },
+          description: { type: "string", description: "Merchant / description as printed" },
+          amount: { type: "number", description: "Positive = money out (purchase, withdrawal, transfer sent). Negative = money in (refund, credit, payment received)" },
+          ref: { ...nullable("string"), description: "Where it is: page and line (e.g. 'p.2 #14') or spreadsheet row (e.g. 'L12')" },
+        },
+      },
+    },
+  },
+};
+
+const STATEMENT_PROMPT = `You read bank and credit-card statements: PDF statements, photos, screenshots of a banking app, or spreadsheet/CSV exports.
+
+Rules:
+- List every transaction line, in order. Skip opening/closing balances, totals, interest or fee summaries that are not transactions, and headers.
+- Dates must be YYYY-MM-DD. If only day and month are shown, take the year from the statement period (watch for periods spanning December–January).
+- amount: positive for money going out (purchases, withdrawals, transfers sent, pre-authorised debits); negative for money coming in (refunds, credits, deposits, card payments received).
+- Never output full card or account numbers: account_last4 holds at most the last 4 digits.
+- ref tells where the line is: page and line number for PDFs/photos (e.g. "p.2 #14"), row for spreadsheets (e.g. "L12").
+- Keep descriptions as printed. Don't invent transactions; if a line is unreadable, skip it.
+- If the file is not a statement, return an empty transactions array.`;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -238,7 +276,7 @@ async function sha256Hex(blob) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function addFiles(fileList) {
+async function addFiles(fileList, { role = "receipt" } = {}) {
   for (const file of [...fileList]) {
     const kind = isPdf(file) ? "pdf" : isSheet(file) ? "sheet"
       : file.type.startsWith("image/") || /\.(heic|heif)$/i.test(file.name) ? "image" : null;
@@ -266,6 +304,7 @@ async function addFiles(fileList) {
       status: "pending",
       receiptIds: [],
       payer: settings.intakePayer,
+      role,
     };
     files.push(rec);
     await saveFile(rec);
@@ -320,70 +359,82 @@ function makeClient() {
   });
 }
 
-async function extract(client, file) {
-  let source;
+/** The file as a content block Claude can read (image, PDF, or spreadsheet as text). */
+async function fileSource(file) {
   if (file.kind === "sheet") {
     const sheets = /\.csv$/i.test(file.name) || file.type === "text/csv"
       ? readCsv(await file.blob.text())
       : await readXlsx(file.blob);
-    source = { type: "text", text: `<spreadsheet name="${file.name}">\n${sheetsToText(sheets)}\n</spreadsheet>` };
-  } else if (file.kind === "pdf") {
-    source = {
+    return { type: "text", text: `<spreadsheet name="${file.name}">\n${sheetsToText(sheets)}\n</spreadsheet>` };
+  }
+  if (file.kind === "pdf") {
+    return {
       type: "document",
       source: { type: "base64", media_type: "application/pdf", data: await readAsBase64(file.blob) },
     };
-  } else {
-    const img = await prepareImage(file.blob, file.type);
-    source = { type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } };
   }
+  const img = await prepareImage(file.blob, file.type);
+  return { type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } };
+}
 
-  const kids = settings.kidsContext ? `\nAbout the children: ${settings.kidsContext}` : "";
-  const types = `\nExpense types for children's items (expense_type):\n${settings.expTypes.map((x) => `- ${x.name}${x.examples ? `: ${x.examples}` : ""}`).join("\n")}`;
-  const what = file.kind === "sheet"
-    ? `This spreadsheet lists expenses${file.payer === "other" ? " paid by the children's other parent" : ""}. Turn each expense row into an entry`
-    : `Extract every receipt in this ${file.kind === "pdf" ? "PDF" : "image"}`;
+/** One structured-output request; returns the parsed JSON. */
+async function askClaude(client, { system, schema, content }) {
   const model = settings.model;
   const params = {
     model,
     max_tokens: 32000,
-    system: SYSTEM_PROMPT,
-    output_config: {
-      effort: "medium",
-      format: { type: "json_schema", schema: receiptSchema() },
-    },
-    messages: [
-      {
-        role: "user",
-        content: [
-          source,
-          {
-            type: "text",
-            text: `${what} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}${types}${t("claude.lang") ? `\n${t("claude.lang")}` : ""}`,
-          },
-        ],
-      },
-    ],
+    system,
+    output_config: { effort: "medium", format: { type: "json_schema", schema } },
+    messages: [{ role: "user", content }],
   };
   if (FALLBACK_MODELS.has(model)) {
     // If a safety classifier declines, the API retries on a recommended model in the same call.
     params.betas = ["server-side-fallback-2026-07-01"];
     params.fallbacks = "default";
   }
-
   const message = await client.beta.messages.stream(params).finalMessage();
-
   if (message.stop_reason === "refusal") {
     throw new Error(`${t("e.refused")}${message.stop_details?.explanation ? `: ${message.stop_details.explanation}` : "."}`);
   }
-  if (message.stop_reason === "max_tokens") {
-    throw new Error(t("e.cutoff"));
-  }
+  if (message.stop_reason === "max_tokens") throw new Error(t("e.cutoff"));
   const text = message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
   try {
-    return JSON.parse(text).receipts || [];
+    return JSON.parse(text);
   } catch {
     throw new Error(t("e.unreadable"));
   }
+}
+
+async function extract(client, file) {
+  const source = await fileSource(file);
+  const kids = settings.kidsContext ? `\nAbout the children: ${settings.kidsContext}` : "";
+  const types = `\nExpense types for children's items (expense_type):\n${settings.expTypes.map((x) => `- ${x.name}${x.examples ? `: ${x.examples}` : ""}`).join("\n")}`;
+  const what = file.kind === "sheet"
+    ? `This spreadsheet lists expenses${file.payer === "other" ? " paid by the children's other parent" : ""}. Turn each expense row into an entry`
+    : `Extract every receipt in this ${file.kind === "pdf" ? "PDF" : "image"}`;
+  const out = await askClaude(client, {
+    system: SYSTEM_PROMPT,
+    schema: receiptSchema(),
+    content: [source, {
+      type: "text",
+      text: `${what} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}${types}${t("claude.lang") ? `\n${t("claude.lang")}` : ""}`,
+    }],
+  });
+  return out.receipts || [];
+}
+
+async function extractStatement(client, file) {
+  const source = await fileSource(file);
+  const out = await askClaude(client, {
+    system: STATEMENT_PROMPT,
+    schema: STATEMENT_SCHEMA,
+    content: [source, { type: "text", text: `Read the transactions in this statement (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.` }],
+  });
+  return {
+    ...out,
+    account_last4: out.account_last4 ? String(out.account_last4).replace(/\D/g, "").slice(-4) || null : null,
+    transactions: (out.transactions || []).map((x, i) => ({ ...x, id: `T${i + 1}`, use: null })),
+  };
 }
 
 function describeError(err) {
@@ -456,10 +507,17 @@ async function processAll() {
       file.status = "working";
       render();
       try {
-        const extracted = await extract(client, file);
-        file.receiptIds = await createReceipts(file, extracted);
-        file.status = "done";
-        if (!extracted.length) toast(t("t.noReceipt", { name: file.name }), 4000);
+        if (file.role === "statement") {
+          file.statement = await extractStatement(client, file);
+          file.status = "done";
+          await log("statement_read", "", t("lg.stRead", { name: file.name, n: file.statement.transactions.length }));
+          if (!file.statement.transactions.length) toast(t("t.noTx", { name: file.name }), 4000);
+        } else {
+          const extracted = await extract(client, file);
+          file.receiptIds = await createReceipts(file, extracted);
+          file.status = "done";
+          if (!extracted.length) toast(t("t.noReceipt", { name: file.name }), 4000);
+        }
       } catch (err) {
         console.error(err);
         file.status = "error";
@@ -548,8 +606,21 @@ function itemKidsAmount(it, factor) {
 
 const dupKey = (r) => `${(r.store_name || "").toLowerCase().trim()}|${r.date || ""}|${receiptTotal(r).toFixed(2)}`;
 
+/** Active receipts (not made from a statement) with the same total within ±3 days. */
+function sameAmountNearby(amount, date, exceptId) {
+  const day = (d) => (d ? Date.parse(d) / 86400000 : NaN);
+  return receipts.filter((r) => !r.voided && !r.fromStatement && r.id !== exceptId
+    && Math.abs(receiptTotal(r) - amount) < 0.011 && Math.abs(day(r.date) - day(date)) <= 3);
+}
+
 function duplicateIds() {
   const groups = new Map();
+  for (const r of receipts) {
+    if (r.voided || !r.fromStatement) continue;
+    for (const x of sameAmountNearby(receiptTotal(r), r.date, r.id)) {
+      groups.set(`st|${r.id}`, [...new Set([...(groups.get(`st|${r.id}`) || [r.id]), x.id])]);
+    }
+  }
   for (const r of receipts) {
     if (r.voided) continue;
     const k = dupKey(r);
@@ -557,7 +628,7 @@ function duplicateIds() {
   }
   const out = new Map();
   for (const ids of groups.values()) {
-    if (ids.length > 1) ids.forEach((id) => out.set(id, ids.filter((x) => x !== id)));
+    if (ids.length > 1) ids.forEach((id) => out.set(id, [...new Set([...(out.get(id) || []), ...ids.filter((x) => x !== id)])]));
   }
   return out;
 }
@@ -788,7 +859,7 @@ function wrapText(ctx, text, maxWidth) {
  * original's fingerprint. Meant for printing/sharing; the original stays untouched.
  */
 async function stampedImage(f) {
-  if (f.kind !== "image" || !f.blob) return null;
+  if (f.kind !== "image" || !f.blob || f.role === "statement") return null;
   let bmp;
   try { bmp = await createImageBitmap(f.blob, { imageOrientation: "from-image" }); } catch { return null; }
   const scale = Math.min(1, 3000 / Math.max(bmp.width, bmp.height));
@@ -863,6 +934,106 @@ async function removeFile(id) {
   await db.del("files", id);
   await log("file_removed", "", t("lg.removed", { name: f.name }));
   render();
+}
+
+// ---------------------------------------------------------------------------
+// Statements: pick lines as expenses, or as proof of payment for a receipt/invoice
+// ---------------------------------------------------------------------------
+const stLabel = (f) => {
+  const s = f.statement || {};
+  return `${s.institution || f.name}${s.account_last4 ? ` ••${s.account_last4}` : ""}`;
+};
+
+/** A transaction counts as used unless the expense made from it was voided. */
+function txUse(tx) {
+  if (!tx.use) return null;
+  const r = getReceipt(tx.use.receiptId);
+  if (!r || (tx.use.type === "expense" && r.voided)) return null;
+  return { type: tx.use.type, r };
+}
+
+async function addTxAsExpense(f, tx) {
+  const same = sameAmountNearby(tx.amount, tx.date);
+  if (same.length && !confirm(t("c.txDupe", { ids: same.map((r) => `${r.id} (${r.store_name || ""}, ${r.date || "—"})`).join(", ") }))) return;
+  const s = f.statement;
+  const r = {
+    id: nextReceiptId(),
+    fileId: f.id, source: f.name, sha256: f.sha256, addedAt: f.addedAt,
+    extractedAt: new Date().toISOString(), model: null,
+    store_name: tx.description, store_address: null, date: tx.date, time: null,
+    currency: s.currency || settings.currency, receipt_number: null,
+    payment_method: stLabel(f), source_ref: tx.ref,
+    items: [{
+      description: tx.description, quantity: null, unit_price: null, line_total: tx.amount, category: null,
+      likely_for_children: null, ai_suggestion: null, ai_type: null, exp_type: null, alloc: "review", split_pct: settings.splitDefault,
+    }],
+    subtotal: null, discount: null, tax: null, tip: null, total: tx.amount, notes: null,
+    document_type: "statement", payer: f.payer || "me", declared: false, fromStatement: true,
+    reviewed: false, note: "", voided: false, voidReason: "",
+  };
+  receipts.push(r);
+  f.receiptIds = [...(f.receiptIds || []), r.id];
+  tx.use = { type: "expense", receiptId: r.id };
+  await saveReceipt(r);
+  await saveFile(f);
+  await log("statement_expense", r.id, t("lg.stExpense", { desc: tx.description, amt: fmtNum(tx.amount), date: tx.date || "", st: stLabel(f), ref: tx.ref || "" }));
+  toast(t("t.txAdded", { id: r.id }));
+  render();
+}
+
+async function linkProof(f, tx, r) {
+  if (r.paymentProof) await unlinkProof(r, { silent: true });
+  r.paymentProof = {
+    fileId: f.id, txId: tx.id, date: tx.date, amount: tx.amount, description: tx.description,
+    ref: tx.ref, source: f.name, sha256: f.sha256, account: stLabel(f),
+  };
+  tx.use = { type: "proof", receiptId: r.id };
+  linkOpen = null;
+  await saveReceipt(r);
+  await saveFile(f);
+  await log("proof_linked", r.id, t("lg.proof", { desc: tx.description, amt: fmtNum(tx.amount), date: tx.date || "", st: stLabel(f), ref: tx.ref || "" }));
+  render();
+}
+
+async function unlinkProof(r, { silent = false } = {}) {
+  const p = r.paymentProof;
+  if (!p) return;
+  const f = files.find((x) => x.id === p.fileId);
+  const tx = f?.statement?.transactions.find((x) => x.id === p.txId);
+  if (tx) { tx.use = null; await saveFile(f); }
+  delete r.paymentProof;
+  await saveReceipt(r);
+  await log("proof_unlinked", r.id, t("lg.proof", { desc: p.description, amt: fmtNum(p.amount), date: p.date || "", st: p.account, ref: p.ref || "" }));
+  if (!silent) render();
+}
+
+async function releaseTx(f, tx) {
+  const use = txUse(tx);
+  if (!use) return;
+  if (use.type === "proof") return unlinkProof(use.r);
+  if (!confirm(t("c.releaseTx", { id: use.r.id }))) return;
+  use.r.voided = true;
+  use.r.voidReason = t("st.released");
+  await saveReceipt(use.r);
+  await log("voided", use.r.id, use.r.voidReason);
+  tx.use = null;
+  await saveFile(f);
+  render();
+}
+
+/** Receipts that could be paid by this transaction: same amount first, then close dates. */
+function proofCandidates(tx) {
+  const day = (d) => (d ? Date.parse(d) / 86400000 : NaN);
+  return receipts
+    .filter((r) => !r.voided && !r.fromStatement)
+    .map((r) => {
+      const days = Math.abs(day(r.date) - day(tx.date));
+      const same = Math.abs(receiptTotal(r) - Math.abs(tx.amount)) < 0.011;
+      return { r, days: Number.isFinite(days) ? days : 999, same };
+    })
+    .filter((x) => (x.same ? x.days <= 10 : x.days <= 5))
+    .sort((a, b) => (b.same - a.same) || a.days - b.days)
+    .slice(0, 6);
 }
 
 // ---------------------------------------------------------------------------
@@ -949,7 +1120,8 @@ function buildReport() {
     if (tagged) L.push(t("r.kidsLine", { t: fmtMoney(a.kids, c) }) + (a.pending ? t("r.kidsPending", { n: a.pending }) : ""));
     if (r.payer === "other") L.push(`  ${t("badge.payerOther")}`);
     if (r.declared) L.push(`  ${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
-    if (r.document_type === "invoice") L.push(t("r.invoice"));
+    if (r.paymentProof) L.push(`  ${t("r.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "", amt: fmtNum(r.paymentProof.amount), ref: r.paymentProof.ref || "" })}`);
+    if (r.fromStatement) L.push(`  ${t("badge.fromStatement")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
     if (r.payment_method) L.push(t("r.paid", { p: r.payment_method }));
     for (const it of a.items) {
       const tag = (!tagged ? "-"
@@ -1001,12 +1173,17 @@ function itemRows(list) {
         it ? `${it.linked ? "↳ " : ""}${ALLOC_LABEL[it.alloc]}` : "", it && isKidsLine(it) ? it.exp_type || "" : "",
         it?.alloc === "split" ? it.split_pct : "", it ? itemKidsAmount(it, a.factor) : "",
         it?.ai_suggestion ? t(`sug.${it.ai_suggestion}`) : "", it?.ai_type || "", a.total, a.kids, curOf(r), r.payment_method, yesNo(r.reviewed),
-        yesNo(r.voided), r.voidReason, yesNo(r.declared), r.source_ref, r.note, r.source, r.sha256, r.addedAt,
+        yesNo(r.voided), r.voidReason, yesNo(r.declared), r.source_ref, r.note, r.source, r.sha256, r.addedAt, proofText(r),
       ]);
     }
   }
   return rows;
 }
+
+const proofText = (r) => (r.paymentProof
+  ? t("r.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "", amt: fmtNum(r.paymentProof.amount), ref: r.paymentProof.ref || "" })
+    + ` · ${r.paymentProof.source} · SHA-256 ${r.paymentProof.sha256}`
+  : r.fromStatement ? t("badge.fromStatement") : "");
 
 /** One row per receipt. */
 function receiptRows(list) {
@@ -1016,7 +1193,7 @@ function receiptRows(list) {
     rows.push([
       r.id, r.date, r.time, r.store_name, docLabel(r), payerLabel(r), curOf(r), r.subtotal, r.tax, extraDiscount(r) || null, r.tip, a.total,
       a.kids, a.not, a.review, r.payment_method, yesNo(r.reviewed), yesNo(r.voided), r.voidReason, yesNo(r.declared), r.source_ref,
-      r.note, r.notes, r.source, r.sha256, r.addedAt,
+      r.note, r.notes, r.source, r.sha256, r.addedAt, proofText(r),
     ]);
   }
   return rows;
@@ -1041,6 +1218,9 @@ function safeName(s) {
   return s.replace(/[^\w.\- ]+/g, "_").slice(0, 80);
 }
 
+/** Receipt IDs that rely on a statement (expenses made from it, or proofs of payment). */
+const statementRefs = (f, list) => list.filter((r) => r.fileId === f.id || r.paymentProof?.fileId === f.id).map((r) => r.id);
+
 function originalPath(f) {
   const ext = (f.name.match(/\.[a-z0-9]+$/i) || [""])[0] || (f.kind === "pdf" ? ".pdf" : ".jpg");
   const base = safeName(f.name.replace(/\.[a-z0-9]+$/i, ""));
@@ -1057,7 +1237,12 @@ async function buildPack({ full = false } = {}) {
     ? receipts.slice().sort((a, b) => a.id.localeCompare(b.id))
     : reportReceipts();
   const ids = new Set(list.map((r) => r.fileId));
-  const pf = files.filter((f) => f.blob && (full ? f.status === "done" || ids.has(f.id) : ids.has(f.id)));
+  for (const r of list) if (r.paymentProof) ids.add(r.paymentProof.fileId);
+  const used = files.filter((f) => f.blob && (full ? f.status === "done" || ids.has(f.id) : ids.has(f.id)));
+  // An evidence pack lists every original file with its fingerprint but leaves the files themselves
+  // out (they stay on the phone, available on request). A full backup keeps them so it can be restored.
+  const pf = full ? used : [];
+  const withheld = full ? [] : used;
 
   const stamped = [];
   for (const f of pf) {
@@ -1067,6 +1252,7 @@ async function buildPack({ full = false } = {}) {
   const manifest = toCsv([
     t("csv.manifest"),
     ...pf.map((f) => [originalPath(f), f.name, (f.receiptIds || []).join(" "), f.sha256, f.size, f.addedAt, f.lastModified]),
+    ...withheld.map((f) => [t("pk.withheld"), f.name, statementRefs(f, list).join(" "), f.sha256, f.size, f.addedAt, f.lastModified]),
   ]);
   const label = full ? t("pk.full") : periodLabel();
   const data = JSON.stringify({
@@ -1077,10 +1263,12 @@ async function buildPack({ full = false } = {}) {
     period: label,
     seq,
     receipts: list,
-    files: pf.map(({ blob, ...meta }) => ({ ...meta, packPath: originalPath(meta) })),
+    files: full
+      ? pf.map(({ blob, ...meta }) => ({ ...meta, packPath: originalPath(meta) }))
+      : withheld.map(({ blob, ...meta }) => ({ ...meta, withheld: true })),
     log: logEntries.map(({ seq: _s, ...e }) => e),
   }, null, 2);
-  const readme = [full ? t("pk.readmeFull") : t("pk.readme", { p: label }), "", ...t("pk.lines")].join("\n");
+  const readme = [full ? t("pk.readmeFull") : t("pk.readme", { p: label }), "", ...t(full ? "pk.linesFull" : "pk.lines")].join("\n");
 
   // The report covers the period, or everything for a full backup.
   const savedFrom = $("#periodFrom").value;
@@ -1127,6 +1315,7 @@ async function restorePack(zipFile) {
   let addedFiles = 0, addedReceipts = 0, badHash = 0, missing = 0;
   for (const meta of data.files) {
     if (files.some((f) => f.id === meta.id || f.sha256 === meta.sha256)) continue;
+    if (meta.withheld) continue; // evidence pack: listed with its fingerprint only
     const path = prefix + (meta.packPath || originalPath(meta));
     const blob = await zip.blob(path, meta.type);
     if (!blob) { missing += 1; continue; }
@@ -1199,12 +1388,10 @@ function typeRows(active) {
 function checkLines(list) {
   const active = list.filter((r) => !r.voided);
   const dupes = duplicateIds();
-  const invoices = active.filter((r) => r.document_type === "invoice");
   const dupIds = active.filter((r) => dupes.has(r.id)).map((r) => r.id);
   const out = [];
   const unverified = active.filter((r) => !r.reviewed).length;
   if (unverified) out.push(t("chk.unverified", { n: unverified }));
-  if (invoices.length) out.push(t("chk.invoice", { n: invoices.length, ids: invoices.map((r) => r.id).join(", ") }));
   if (dupIds.length) out.push(t("chk.dupe", { ids: dupIds.join(", ") }));
   const declared = active.filter((r) => r.declared).length;
   if (declared) out.push(t("chk.declared", { n: declared }));
@@ -1501,11 +1688,15 @@ async function buildPdf(list = reportReceipts()) {
     ].filter(Boolean);
     text(meta.join("   ·   "), { size: 9, color: MUTED, gap: 2 });
     const flags = [
-      r.document_type === "invoice" && t("badge.invoice"),
       r.declared && `${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`,
       dupes.has(r.id) && t("badge.dupe", { ids: dupes.get(r.id).join(", ") }),
     ].filter(Boolean);
     if (flags.length) text(flags.join("   ·   "), { size: 9, color: WARN, gap: 2 });
+    const good = [
+      r.fromStatement && `${t("badge.fromStatement")}${r.source_ref ? ` (${r.source_ref})` : ""}`,
+      r.paymentProof && t("r.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "", amt: fmtNum(r.paymentProof.amount), ref: r.paymentProof.ref || "" }),
+    ].filter(Boolean);
+    if (good.length) text(good.join("   ·   "), { size: 9, color: ACCENT, gap: 2 });
 
     const foot = [
       r.tax != null && [t("tax"), fmtNum(r.tax)],
@@ -1673,7 +1864,7 @@ function render() {
   const open = files.filter((f) => f.status !== "done");
   $("#queue").replaceChildren(...open.map((f) => h("li", {},
     thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" })
-      : h("div", { class: "thumb", "aria-hidden": "true" }, f.kind === "pdf" ? "📄" : f.kind === "sheet" ? "📊" : "🧾"),
+      : h("div", { class: "thumb", "aria-hidden": "true" }, f.role === "statement" ? "🏦" : f.kind === "pdf" ? "📄" : f.kind === "sheet" ? "📊" : "🧾"),
     h("div", {},
       h("div", { class: "qname" }, f.name),
       h("div", { class: `qstatus ${f.status}` }, f.status === "error" ? f.error : STATUS_LABEL[f.status])),
@@ -1697,7 +1888,7 @@ function render() {
 
   $("#resultsCard").hidden = receipts.length === 0;
   $("#sendCard").hidden = receipts.length === 0;
-  if (!receipts.length) return;
+  if (!receipts.length) { renderStatements(); return; }
 
   // Totals (all non-voided receipts)
   const active = receipts.filter((r) => !r.voided);
@@ -1751,11 +1942,91 @@ function render() {
     .sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.id.localeCompare(a.id));
   $("#receipts").replaceChildren(...(visible.length ? visible.map((r) => renderReceipt(r, dupes)) : [h("p", { class: "hint" }, t("nothing"))]));
 
+  renderStatements();
   $("#history").replaceChildren(...logEntries.slice(-200).reverse().map((e) =>
     h("div", { class: "log-entry" }, h("time", {}, fmtTs(e.ts)), e.receiptId ? h("b", {}, `${e.receiptId} `) : null, `${actionLabel(e.action)}: ${e.detail}`)));
 
   if (!$("#emailSubject").dataset.edited) $("#emailSubject").value = defaultSubject();
   $("#emailPreview").textContent = buildSummary({ attached: true });
+}
+
+let linkOpen = null;               // "fileId|txId" whose proof picker is open
+const openStatements = new Set();  // statements expanded on screen
+const stQuery = new Map();         // search text per statement
+
+function renderStatements() {
+  const sts = files.filter((f) => f.role === "statement" && f.status === "done" && f.statement);
+  $("#statementsCard").hidden = !sts.length;
+  if (!sts.length) return;
+  $("#statements").replaceChildren(...sts.map((f) => {
+    const s = f.statement;
+    const used = s.transactions.filter(txUse).length;
+    const list = h("div", { class: "tx-list" });
+    const fill = () => list.replaceChildren(...renderTxRows(f));
+    fill();
+    return h("details", {
+      class: "statement", open: openStatements.has(f.id) || null,
+      ontoggle: (e) => (e.target.open ? openStatements.add(f.id) : openStatements.delete(f.id)),
+    },
+    h("summary", {},
+      h("b", {}, `🏦 ${stLabel(f)}`),
+      h("div", { class: "meta" }, [
+        s.period_start || s.period_end ? `${s.period_start || "…"} → ${s.period_end || "…"}` : null,
+        t("st.count", { n: s.transactions.length, used }),
+        f.payer === "other" ? t("badge.payerOther") : null,
+      ].filter(Boolean).join(" · "))),
+    h("div", { class: "statement-tools" },
+      h("input", {
+        class: "search", type: "search", placeholder: t("st.search"), value: stQuery.get(f.id) || "",
+        oninput: (e) => { stQuery.set(f.id, e.target.value); fill(); },
+      }),
+      h("button", { class: "btn small", onclick: () => viewFile(f) }, t("btn.view"))),
+    list);
+  }));
+}
+
+function renderTxRows(f) {
+  const q = (stQuery.get(f.id) || "").toLowerCase();
+  const cur = f.statement.currency || settings.currency;
+  const rows = f.statement.transactions.filter((tx) => !q
+    || `${tx.date || ""} ${tx.description} ${fmtNum(tx.amount)} ${tx.amount}`.toLowerCase().includes(q));
+  if (!rows.length) return [h("p", { class: "hint" }, t("nothing"))];
+  return rows.map((tx) => {
+    const use = txUse(tx);
+    const key = `${f.id}|${tx.id}`;
+    const actions = use
+      ? [h("span", { class: `tx-used ${use.type}` }, t(use.type === "proof" ? "st.usedProof" : "st.usedExpense", { id: use.r.id })),
+        h("button", { class: "btn small ghost", onclick: () => releaseTx(f, tx) }, t("st.release"))]
+      : [h("button", { class: "btn small", onclick: () => addTxAsExpense(f, tx) }, t("st.addExpense"))];
+    let picker = null;
+    if (linkOpen === key && !use) {
+      const cands = proofCandidates(tx);
+      const others = receipts.filter((r) => !r.voided && !r.fromStatement)
+        .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+      picker = h("div", { class: "tx-picker" },
+        h("div", { class: "meta" }, cands.length ? t("st.candidates") : t("st.noCandidates")),
+        cands.map(({ r, same }) => h("button", { class: `btn small ${same ? "primary" : ""}`, onclick: () => linkProof(f, tx, r) },
+          `${r.id} · ${r.date || "—"} · ${r.store_name || ""} · ${fmtMoney(receiptTotal(r), curOf(r))}${r.paymentProof ? " ↺" : ""}`)),
+        others.length ? h("select", {
+          class: "type-select", onchange: (e) => { const r = getReceipt(e.target.value); if (r) linkProof(f, tx, r); },
+        }, h("option", { value: "" }, t("st.otherReceipt")),
+        others.map((r) => h("option", { value: r.id }, `${r.id} · ${r.date || "—"} · ${r.store_name || ""} · ${fmtMoney(receiptTotal(r), curOf(r))}`))) : null);
+    }
+    return h("div", { class: `tx ${use ? "used" : ""} ${tx.amount < 0 ? "credit" : ""}` },
+      h("div", { class: "tx-main" },
+        h("span", { class: "tx-date" }, tx.date || "—"),
+        h("span", { class: "tx-desc" }, tx.description, tx.ref ? h("span", { class: "meta" }, ` · ${tx.ref}`) : null),
+        h("span", { class: "tx-amt" }, fmtMoney(tx.amount, cur))),
+      h("div", { class: "actions" }, actions),
+      picker);
+  });
+}
+
+function viewFile(f) {
+  if (!f?.blob) { toast(t("t.noOriginal")); return; }
+  const url = URL.createObjectURL(f.blob);
+  window.open(url, "_blank");
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function typeSelect(r, idx, it) {
@@ -1784,7 +2055,8 @@ function renderReceipt(r, dupes) {
   if (dupes.has(r.id)) badges.push(h("span", { class: "badge bad" }, t("badge.dupe", { ids: dupes.get(r.id).join(", ") })));
   if (r.payer === "other") badges.push(h("span", { class: "badge other" }, t("badge.payerOther")));
   if (r.declared) badges.push(h("span", { class: "badge warn" }, t("badge.declared")));
-  if (r.document_type === "invoice") badges.push(h("span", { class: "badge warn" }, t("badge.invoice")));
+  if (r.fromStatement) badges.push(h("span", { class: "badge ok" }, t("badge.fromStatement")));
+  if (r.paymentProof) badges.push(h("span", { class: "badge ok" }, t("badge.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "" })));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, t("badge.mismatch", { a: fmtNum(expected), b: fmtNum(r.total) })));
 
   const rows = a.items.map((it, idx) => [h("tr", { class: `${it.alloc === "not" ? "not-kids" : ""} ${isKidsLine(it) && !it.linked ? "has-type" : ""}` },
@@ -1837,7 +2109,7 @@ function renderReceipt(r, dupes) {
             h("td", { class: "num" }, fmtMoney(a.total, c)))))),
     h("div", { class: "actions" },
       h("button", { class: "btn small", onclick: () => viewOriginal(r) }, t("btn.view")),
-      fileOf(r)?.kind === "image" && h("button", { class: "btn small", onclick: () => saveStamped(r) }, t("btn.stamp")),
+      fileOf(r)?.kind === "image" && fileOf(r)?.role !== "statement" && h("button", { class: "btn small", onclick: () => saveStamped(r) }, t("btn.stamp")),
       !r.voided && h("button", { class: "btn small", onclick: () => editNote(r) }, t("btn.note")),
       !r.voided && h("button", {
         class: `btn small ${r.reviewed ? "" : "primary"}`, title: t("verify.title"),
@@ -1848,6 +2120,7 @@ function renderReceipt(r, dupes) {
       h("div", { class: "actions" },
         h("button", { class: "btn small", onclick: () => saveOriginal(r) }, t("btn.saveOrig")),
         !r.voided && h("button", { class: "btn small", onclick: () => togglePayer(r) }, t("btn.payer", { who: payerLabel(r) })),
+        r.paymentProof && h("button", { class: "btn small", onclick: () => unlinkProof(r) }, t("btn.unlinkProof")),
         !r.voided && suggestableCount(r) > 0 && h("button", { class: "btn small", onclick: () => applySuggestions(r) }, t("btn.applyOne")),
         !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "kids") }, t("btn.allKids")),
         !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "not") }, t("btn.noneKids")),
@@ -1923,6 +2196,12 @@ document.querySelectorAll("[data-payer]").forEach((b) => b.addEventListener("cli
   renderPayerToggle();
 }));
 renderPayerToggle();
+
+$("#statementInput").addEventListener("change", async (e) => {
+  const list = [...e.target.files];
+  e.target.value = "";
+  await addFiles(list, { role: "statement" });
+});
 
 for (const id of ["#cameraInput", "#galleryInput", "#pdfInput", "#sheetInput"]) {
   $(id).addEventListener("change", async (e) => {

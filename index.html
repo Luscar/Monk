@@ -49,6 +49,10 @@
           <input id="sheetInput" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple hidden>
           <span class="emoji" aria-hidden="true">📊</span> <span data-i18n="add.sheet">Excel grid</span>
         </label>
+        <label class="btn big">
+          <input id="statementInput" type="file" accept="image/*,application/pdf,.pdf,.csv,.xlsx,text/csv" multiple hidden>
+          <span class="emoji" aria-hidden="true">🏦</span> <span data-i18n="add.statement">Statement</span>
+        </label>
       </div>
       <div class="payer-toggle" role="group">
         <span data-i18n="payer.label">Paid by:</span>
@@ -83,6 +87,12 @@
         <summary data-i18n="history">Change history (audit log)</summary>
         <div id="history"></div>
       </details>
+    </section>
+
+    <section class="card" id="statementsCard" hidden>
+      <h2 data-i18n="st.title">Bank &amp; card statements</h2>
+      <p class="hint" data-i18n="st.hint"></p>
+      <div id="statements"></div>
     </section>
 
     <section class="card" id="sendCard" hidden>
