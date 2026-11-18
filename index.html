@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Receipt Mailer</title>
-  <meta name="description" content="Snap or upload receipts, extract them with Claude, and email a summary.">
+  <meta name="description" content="Capture receipts, tag child expenses item by item, and send a traceable report.">
   <meta name="theme-color" content="#0f766e">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -46,23 +46,39 @@
           <span class="emoji" aria-hidden="true">📄</span> PDF
         </label>
       </div>
-      <p class="hint">Mix as many sources as you like. A single photo or PDF may contain several receipts.</p>
+      <p class="hint">Originals are kept on this device with a fingerprint (SHA-256) so you can prove they haven't been altered. Adding the same file twice is blocked.</p>
       <div id="dropZone" class="drop-zone">…or drop files here</div>
       <ul id="queue" class="queue"></ul>
+      <p id="processedCount" class="hint"></p>
       <div class="row">
         <button id="processBtn" class="btn primary" disabled>Extract with Claude</button>
-        <button id="clearBtn" class="btn ghost" disabled>Clear all</button>
       </div>
     </section>
 
     <section class="card" id="resultsCard" hidden>
-      <h2>2. Review</h2>
+      <h2>2. Tag &amp; review</h2>
+      <p class="hint">Tap the tag on each line to switch between <b>Kids</b>, <b>Split</b> (enter %), and <b>Not kids</b>. Tags start as Claude's suggestion, and every change is logged.</p>
       <div id="totals" class="totals"></div>
+      <div class="filters" role="tablist">
+        <button class="chip-filter" data-filter="all">All</button>
+        <button class="chip-filter" data-filter="review">Needs review</button>
+        <button class="chip-filter" data-filter="dupe">Possible duplicates</button>
+        <button class="chip-filter" data-filter="void">Voided</button>
+      </div>
+      <input id="search" class="search" type="search" placeholder="Search store, item, ID…">
       <div id="receipts"></div>
+      <details class="preview">
+        <summary>Change history (audit log)</summary>
+        <div id="history"></div>
+      </details>
     </section>
 
     <section class="card" id="sendCard" hidden>
-      <h2>3. Send</h2>
+      <h2>3. Report &amp; send</h2>
+      <div class="two-col">
+        <label class="field"><span>From date</span><input id="periodFrom" type="date"></label>
+        <label class="field"><span>To date</span><input id="periodTo" type="date"></label>
+      </div>
       <label class="field">
         <span>Email to</span>
         <input id="emailTo" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
@@ -73,12 +89,14 @@
       </label>
       <div class="row wrap">
         <button id="emailBtn" class="btn primary">Open in Mail</button>
-        <button id="shareBtn" class="btn">Share + CSV</button>
-        <button id="copyBtn" class="btn">Copy summary</button>
+        <button id="shareBtn" class="btn">Share evidence pack</button>
+        <button id="zipBtn" class="btn">Download evidence pack (.zip)</button>
         <button id="csvBtn" class="btn">Download CSV</button>
+        <button id="copyBtn" class="btn">Copy report</button>
       </div>
+      <p class="hint">The evidence pack contains the report, an item-level CSV, the audit log, a fingerprint manifest and every original file renamed by receipt ID. It also works as your backup.</p>
       <details class="preview">
-        <summary>Preview email text</summary>
+        <summary>Preview report</summary>
         <pre id="emailPreview"></pre>
       </details>
     </section>
@@ -100,6 +118,14 @@
         </select>
       </label>
       <label class="field">
+        <span>About the children (helps Claude suggest tags, e.g. "2 kids: girl 6, boy 10")</span>
+        <textarea id="kidsContext" rows="2"></textarea>
+      </label>
+      <label class="field">
+        <span>Default split % for shared items (e.g. groceries)</span>
+        <input id="splitDefault" type="number" min="0" max="100" step="1" placeholder="50">
+      </label>
+      <label class="field">
         <span>Default recipient</span>
         <input id="defaultEmail" type="email" inputmode="email" placeholder="you@example.com">
       </label>
@@ -107,11 +133,13 @@
         <span>Your currency (used when a receipt doesn't show one)</span>
         <input id="defaultCurrency" type="text" maxlength="3" placeholder="USD">
       </label>
-      <p class="hint">Your key is saved in this browser's local storage only. Anyone with access to this device/browser profile could read it — use a key with a spend limit.</p>
+      <p class="hint">Your key is saved in this browser only. Use a key with a spend limit.</p>
       <div class="row">
         <button value="save" class="btn primary">Save</button>
         <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
       </div>
+      <hr>
+      <button type="button" id="wipeBtn" class="btn ghost danger">Erase all data on this device…</button>
     </form>
   </dialog>
 

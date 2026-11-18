@@ -27,6 +27,18 @@ python3 -m http.server 8000
 
 Open ⚙ Settings, paste your API key (create one at console.anthropic.com — setting a monthly spend limit on it is a good idea), pick a model and your default recipient.
 
+## Child-expense tracking & traceability
+
+Built for documenting money spent on children (e.g. in a separation or divorce):
+
+- **Permanent receipt IDs** (`R-2026-0001`, …) that are never reused. Refer to them in emails and spreadsheets.
+- **Originals kept unmodified** on the device with a **SHA-256 fingerprint** and the time each file was added. Adding the same file twice is blocked.
+- **Item-level tags**: each line is *Kids*, *Split n%*, *Not kids* or *Review?*. Claude suggests a tag (you can describe the children in Settings), and you confirm it. Tax and receipt discounts are shared out in proportion to the item amounts.
+- **Corrections** to amounts, store, date and total, plus **notes** (e.g. which child, why).
+- **Audit log** of every action with UTC timestamps. Receipts are **voided with a reason, never deleted**, so they stay visible in the report.
+- **Possible-duplicate warning** (same store + date + total).
+- **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json` and `originals/` named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
+
 ## Notes
 
 - **Model**: defaults to Claude Opus 5.5 (most accurate on faded/crumpled receipts). Sonnet 5.5 and Haiku 5.5 are cheaper options in Settings. Opus/Sonnet requests opt into server-side refusal fallbacks.
