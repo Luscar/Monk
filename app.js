@@ -1,6 +1,7 @@
 import Anthropic from "./vendor/anthropic-sdk.js";
 import { db } from "./db.js";
 import { makeZip, readZip } from "./zip.js";
+import { makeXlsx } from "./xlsx.js";
 import { t, lang, locale, regionCurrency, actionLabel, applyStatic } from "./i18n.js";
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ const RECEIPT_SCHEMA = {
         required: [
           "store_name", "store_address", "date", "time", "currency",
           "receipt_number", "payment_method", "items",
-          "subtotal", "discount", "tax", "tip", "total", "notes",
+          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type",
         ],
         properties: {
           store_name: { type: "string" },
@@ -84,7 +85,12 @@ const RECEIPT_SCHEMA = {
           tax: nullable("number"),
           tip: nullable("number"),
           total: nullable("number"),
-          notes: { ...nullable("string"), description: "Illegible parts, assumptions, or mismatches" },
+          notes: { ...nullable("string"), description: "At most 2 short sentences: illegible parts, assumptions, or mismatches" },
+          document_type: {
+            type: "string",
+            enum: ["receipt", "invoice", "other"],
+            description: "receipt = proof of a completed payment; invoice = bill/quote/statement that does not show the payment was made",
+          },
         },
       },
     },
@@ -100,6 +106,9 @@ Rules:
 - Dates must be YYYY-MM-DD. Resolve ambiguous day/month order using the store's country or currency when possible, and mention any ambiguity in notes.
 - Use null for any field that is not printed or not legible. Never invent values.
 - If the printed total does not match the sum of items plus tax, keep the printed values and explain in notes.
+- date is the transaction or invoice date printed on the document, never today's date. Use null if none is printed.
+- Keep notes brief (at most 2 short sentences, or null when there is nothing worth flagging). Don't restate amounts already captured in other fields.
+- document_type: "receipt" if it shows a completed payment (e.g. paid, card approved, change given); "invoice" for a bill, amount due, quote or statement without proof of payment; otherwise "other".
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
 - If the file contains no receipt at all, return an empty receipts array.`;
 
@@ -790,7 +799,7 @@ function buildReport() {
   L.push(t("r.receipts", { n: active.length }) + (voided.length ? t("r.voidedExcl", { n: voided.length }) : ""));
   L.push("");
   for (const [c, tot] of Object.entries(totals)) {
-    L.push(t("r.totalSpent", { t: fmtMoney(tot.total, c), x: fmtMoney(tot.tax, c) }));
+    L.push(t("r.totalSpent", { c, t: fmtMoney(tot.total, c), x: fmtMoney(tot.tax, c) }));
     if (anyTagged) {
       L.push(t("r.forKids", { t: fmtMoney(tot.kids, c) }));
       L.push(t("r.notKids", { t: fmtMoney(tot.not, c) }));
@@ -808,11 +817,15 @@ function buildReport() {
     const st = `${r.store_name || t("r.unknown")}|${c}`;
     byStore[st] = (byStore[st] || 0) + receiptTotal(r);
   }
+  const multiCur = Object.keys(totals).length > 1;
   const section = (title, obj, sort) => {
     const rows = Object.entries(obj).sort(sort);
     if (rows.length < 2) return;
     L.push(title);
-    for (const [k, v] of rows) { const [name, c] = k.split("|"); L.push(`  ${name}: ${fmtMoney(v, c)}`); }
+    for (const [k, v] of rows) {
+      const [name, c] = k.split("|");
+      L.push(`  ${name}${multiCur ? ` (${c})` : ""}: ${fmtMoney(v, c)}`);
+    }
     L.push("");
   };
   section(t("r.byMonth"), byMonth, (a, b) => a[0].localeCompare(b[0]));
@@ -821,6 +834,7 @@ function buildReport() {
   const unverified = active.filter((r) => !r.reviewed).length;
   if (unverified) L.push(t("r.unverified", { n: unverified }), "");
   if (anyTagged) L.push(t("r.legend"), t("r.legend2"), "");
+  L.push(t("r.dateLegend"), "");
   L.push(t("r.receiptsHdr"));
   for (const r of active) {
     const a = allocation(r);
@@ -829,6 +843,7 @@ function buildReport() {
     L.push("");
     L.push(`${r.id} | ${r.date || t("r.noDate")}${r.time ? ` ${r.time}` : ""} | ${r.store_name || t("unknownStore")} | ${fmtMoney(a.total, c)}${r.reviewed ? t("r.verified") : ""}`);
     if (tagged) L.push(t("r.kidsLine", { t: fmtMoney(a.kids, c) }) + (a.pending ? t("r.kidsPending", { n: a.pending }) : ""));
+    if (r.document_type === "invoice") L.push(t("r.invoice"));
     if (r.payment_method) L.push(t("r.paid", { p: r.payment_method }));
     for (const it of r.items) {
       const tag = !tagged ? "-"
@@ -859,30 +874,55 @@ function buildReport() {
   return L.join("\n");
 }
 
-const CSV_SEP = lang === "fr" ? ";" : ",";
-
 function csvCell(v) {
   if (v == null) return "";
-  const s = typeof v === "number" && lang === "fr" ? String(v).replace(".", ",") : String(v);
-  return s.includes(CSV_SEP) || /["\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  const s = String(v);
+  return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
-const toCsv = (rows) => "﻿" + rows.map((row) => row.map(csvCell).join(CSV_SEP)).join("\r\n");
+const toCsv = (rows) => "﻿" + rows.map((row) => row.map(csvCell).join(",")).join("\r\n");
 const yesNo = (b) => t(b ? "yes" : "no");
+const docLabel = (r) => (r.document_type ? t(`doc.${r.document_type}`) : "");
 
-function buildItemsCsv(list = reportReceipts()) {
+/** One row per receipt line (header first). Shared by the CSV and the Excel "Items" sheet. */
+function itemRows(list) {
   const rows = [t("csv.items")];
   for (const r of list) {
     const a = allocation(r);
     for (const it of r.items.length ? r.items : [null]) {
       rows.push([
-        r.id, r.date, r.time, r.store_name, it?.description, it?.category, it?.quantity, it?.unit_price, it?.line_total,
+        r.id, r.date, r.time, r.store_name, docLabel(r), it?.description, it?.category, it?.quantity, it?.unit_price, it?.line_total,
         it ? ALLOC_LABEL[it.alloc] : "", it?.alloc === "split" ? it.split_pct : "", it ? itemKidsAmount(it, a.factor) : "",
         it?.ai_suggestion ? t(`sug.${it.ai_suggestion}`) : "", a.total, a.kids, curOf(r), r.payment_method, yesNo(r.reviewed),
         yesNo(r.voided), r.voidReason, r.note, r.source, r.sha256, r.addedAt,
       ]);
     }
   }
-  return toCsv(rows);
+  return rows;
+}
+
+/** One row per receipt. */
+function receiptRows(list) {
+  const rows = [t("xl.receiptsHdr")];
+  for (const r of list) {
+    const a = allocation(r);
+    rows.push([
+      r.id, r.date, r.time, r.store_name, docLabel(r), curOf(r), r.subtotal, r.tax, r.discount, r.tip, a.total,
+      a.kids, a.not, a.review, r.payment_method, yesNo(r.reviewed), yesNo(r.voided), r.voidReason, r.note, r.notes,
+      r.source, r.sha256, r.addedAt,
+    ]);
+  }
+  return rows;
+}
+
+function buildItemsCsv(list = reportReceipts()) {
+  return toCsv(itemRows(list));
+}
+
+function buildXlsx(list = reportReceipts()) {
+  return makeXlsx([
+    { name: t("xl.sheetReceipts"), rows: receiptRows(list), money: [6, 7, 8, 9, 10, 11, 12, 13], widths: { 21: 20 } },
+    { name: t("xl.sheetItems"), rows: itemRows(list), money: [8, 9, 12, 14, 15], widths: { 23: 20 } },
+  ]);
 }
 
 function buildLogCsv() {
@@ -945,6 +985,7 @@ async function buildPack({ full = false } = {}) {
   const zip = await makeZip([
     { name: "README.txt", data: readme },
     { name: "report.txt", data: report },
+    { name: `${t("xl.file")}.xlsx`, data: await buildXlsx(list) },
     { name: "items.csv", data: buildItemsCsv(list) },
     { name: "audit-log.csv", data: buildLogCsv() },
     { name: "manifest.csv", data: manifest },
@@ -1032,7 +1073,7 @@ function download(file) {
 async function sendEmail() {
   const to = $("#emailTo").value.trim();
   const subject = $("#emailSubject").value.trim() || defaultSubject();
-  const body = buildReport();
+  const body = buildReport().replace(/\r?\n/g, "\r\n");
   if (to) store.set("lastEmail", to);
   let url = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   if (url.length > 30000) {
@@ -1179,6 +1220,7 @@ function renderReceipt(r, dupes) {
   const tagged = isTagged(r);
   if (tagged && a.pending) badges.push(h("span", { class: "badge warn" }, t("badge.untagged", { n: a.pending })));
   if (dupes.has(r.id)) badges.push(h("span", { class: "badge bad" }, t("badge.dupe", { ids: dupes.get(r.id).join(", ") })));
+  if (r.document_type === "invoice") badges.push(h("span", { class: "badge warn" }, t("badge.invoice")));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, t("badge.mismatch", { a: fmtNum(expected), b: fmtNum(r.total) })));
 
   const rows = r.items.map((it, idx) => h("tr", { class: it.alloc === "not" ? "not-kids" : "" },
@@ -1213,7 +1255,7 @@ function renderReceipt(r, dupes) {
       h("div", {},
         h("span", { class: "rid" }, r.id),
         h("h3", {}, r.store_name || t("unknownStore")),
-        h("div", { class: "meta" }, [r.date || t("noDate"), r.time, r.payment_method].filter(Boolean).join(" · ")),
+        h("div", { class: "meta" }, [r.date ? t("receiptDate", { d: r.date }) : t("noDate"), r.time, r.payment_method].filter(Boolean).join(" · ")),
         h("div", { class: "meta" }, `${r.source} · ${t("added", { ts: fmtTs(r.addedAt) })} · #${r.sha256.slice(0, 8)}`))),
     h("div", { class: "badges" }, badges),
     tagged
@@ -1345,8 +1387,9 @@ $("#shareBtn").addEventListener("click", sharePack);
 $("#zipBtn").addEventListener("click", async () => {
   try { download(await buildPack()); render(); } catch (err) { console.error(err); toast(t("t.packFail")); }
 });
-$("#csvBtn").addEventListener("click", () => {
-  download(new File([buildItemsCsv()], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.csv`, { type: "text/csv" }));
+$("#csvBtn").addEventListener("click", async () => {
+  const blob = await buildXlsx();
+  download(new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
 });
 $("#copyBtn").addEventListener("click", async () => {
   toast((await copyText(buildReport())) ? t("t.copied") : t("t.copyFail"));
