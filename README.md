@@ -43,6 +43,14 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 - **Full backup & restore** (Settings): one .zip with everything. Restoring on a new phone re-checks every fingerprint, merges without duplicates, and carries on with the ID numbering. The app reminds you when the last backup is more than 7 days old.
 - **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json`, `originals/` and `stamped/`, named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
 
+## Sensitive documents (never sent to Claude)
+
+Tick **🔒 Sensitive documents** under "Add receipts" before adding files, or tap the 🔒 button on a file in the queue. A sensitive file:
+
+- stays on the device with its fingerprint, like every other original, but is **never sent to Claude** ("Extract with Claude" skips it, and the code refuses to build a Claude request for it);
+- gets a **✍️ Enter by hand** button: store, date, currency, payment method, lines (description + amount), tax, total, note. *Save & add another* handles a file holding several receipts, and "More… → Add another entry from this file" works later too;
+- produces receipts with the same IDs, tags, verification and reports as the others, marked *Entered by hand (sensitive document)*. The audit log records when a file is marked sensitive and each manual entry.
+
 ## Language
 
 The app is in **English or French**, following the phone's language (any `fr-*` setting gives French). You can override it in Settings → Language. In French:
