@@ -60,6 +60,10 @@
         <button type="button" data-payer="other" data-i18n="payer.other">Other parent</button>
       </div>
       <p class="hint" data-i18n="add.payerHint"></p>
+      <label class="check sensitive-toggle">
+        <input id="sensitiveToggle" type="checkbox">
+        <span data-i18n-html="sens.toggle"></span>
+      </label>
       <p class="hint" data-i18n="add.hint"></p>
       <div id="dropZone" class="drop-zone" data-i18n="add.drop">…or drop files here</div>
       <ul id="queue" class="queue"></ul>
@@ -196,6 +200,42 @@
       </div>
       <hr>
       <button type="button" id="wipeBtn" class="btn ghost danger" data-i18n="wipe.btn">Erase all data on this device…</button>
+    </form>
+  </dialog>
+
+  <dialog id="manualDialog">
+    <form method="dialog" class="settings" id="manualForm">
+      <h2 data-i18n="man.title">Manual entry</h2>
+      <p class="hint" id="manualFile"></p>
+      <label class="field"><span data-i18n="man.store">Store / payee</span><input id="mStore" type="text" required></label>
+      <div class="two-col">
+        <label class="field"><span data-i18n="man.date">Date</span><input id="mDate" type="date"></label>
+        <label class="field"><span data-i18n="man.currency">Currency</span><input id="mCurrency" type="text" maxlength="3"></label>
+      </div>
+      <div class="two-col">
+        <label class="field"><span data-i18n="man.payment">Payment method</span><input id="mPayment" type="text"></label>
+        <label class="field"><span data-i18n="man.doctype">Document</span>
+          <select id="mDocType">
+            <option value="receipt" data-i18n="doc.receipt">Receipt</option>
+            <option value="invoice" data-i18n="doc.invoice">Invoice</option>
+            <option value="other" data-i18n="doc.other">Other</option>
+          </select>
+        </label>
+      </div>
+      <div class="field"><span data-i18n="man.items">Lines (description and amount)</span>
+        <div id="mItems" class="man-items"></div>
+        <button type="button" id="mAddLine" class="btn small" data-i18n="man.addLine">+ Add a line</button>
+      </div>
+      <div class="two-col">
+        <label class="field"><span data-i18n="man.tax">Tax (optional)</span><input id="mTax" type="text" inputmode="decimal"></label>
+        <label class="field"><span data-i18n="man.total">Total (blank = lines + tax)</span><input id="mTotal" type="text" inputmode="decimal"></label>
+      </div>
+      <label class="field"><span data-i18n="man.note">Note (optional)</span><input id="mNote" type="text"></label>
+      <div class="row wrap">
+        <button value="save" class="btn primary" data-i18n="man.save">Save</button>
+        <button value="again" class="btn" data-i18n="man.again">Save &amp; add another</button>
+        <button value="cancel" class="btn ghost" formnovalidate data-i18n="set.cancel">Cancel</button>
+      </div>
     </form>
   </dialog>
 

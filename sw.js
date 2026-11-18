@@ -1,5 +1,5 @@
 // Bump this when you change any app file so installed copies update.
-const CACHE = "receipt-mailer-v12";
+const CACHE = "receipt-mailer-v13";
 const SHELL = [
   "./",
   "./index.html",

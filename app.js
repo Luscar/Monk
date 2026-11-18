@@ -31,6 +31,8 @@ const settings = {
     }).filter((x) => x.name);
   },
   get intakePayer() { return store.get("intakePayer") === "other" ? "other" : "me"; },
+  /** New files are marked sensitive: kept on the device, never sent to Claude, entered by hand. */
+  get intakeSensitive() { return store.get("intakeSensitive") === "1"; },
   get kidsContext() { return store.get("kidsContext").trim(); },
   get splitDefault() {
     const raw = store.get("splitDefault").trim();
@@ -305,10 +307,13 @@ async function addFiles(fileList, { role = "receipt" } = {}) {
       receiptIds: [],
       payer: settings.intakePayer,
       role,
+      sensitive: settings.intakeSensitive,
     };
+    if (rec.sensitive) rec.status = "manual";
     files.push(rec);
     await saveFile(rec);
-    await log("file_added", "", t("lg.fileAdded", { name: rec.name, size: rec.size, sha: sha256 }));
+    await log("file_added", "", t("lg.fileAdded", { name: rec.name, size: rec.size, sha: sha256 })
+      + (rec.sensitive ? ` · ${t("lg.sensitiveTag")}` : ""));
   }
   render();
 }
@@ -361,6 +366,8 @@ function makeClient() {
 
 /** The file as a content block Claude can read (image, PDF, or spreadsheet as text). */
 async function fileSource(file) {
+  // Last line of defence: a sensitive file never leaves the device.
+  if (file.sensitive) throw new Error(t("e.sensitive"));
   if (file.kind === "sheet") {
     const sheets = /\.csv$/i.test(file.name) || file.type === "text/csv"
       ? readCsv(await file.blob.text())
@@ -493,7 +500,7 @@ async function createReceipts(file, extracted) {
 
 async function processAll() {
   if (!settings.apiKey) { openSettings(); return; }
-  const todo = files.filter((f) => f.status === "pending" || f.status === "error");
+  const todo = files.filter((f) => !f.sensitive && (f.status === "pending" || f.status === "error"));
   if (!todo.length) return;
   processing = true;
   const client = makeClient();
@@ -937,6 +944,97 @@ async function removeFile(id) {
 }
 
 // ---------------------------------------------------------------------------
+// Sensitive documents: never sent to Claude, entered by hand
+// ---------------------------------------------------------------------------
+async function toggleSensitive(f) {
+  if (f.status === "done" || f.status === "working" || f.status === "queued" || f.receiptIds?.length) return;
+  f.sensitive = !f.sensitive;
+  f.status = f.sensitive ? "manual" : "pending";
+  f.error = undefined;
+  await saveFile(f);
+  await log("sensitivity_changed", "", t(f.sensitive ? "lg.sensitiveOn" : "lg.sensitiveOff", { name: f.name }));
+  render();
+}
+
+let manualTarget = null;
+
+function manualLine(desc = "", amt = "") {
+  const row = h("div", { class: "man-line" },
+    h("input", { type: "text", class: "desc", placeholder: t("man.linePh"), value: desc, "aria-label": t("man.lineDesc") }),
+    h("input", { type: "text", class: "amt", inputmode: "decimal", placeholder: "0,00", value: amt, "aria-label": t("man.lineAmt") }),
+    h("button", {
+      type: "button", class: "btn small ghost", "aria-label": t("man.removeLine"),
+      onclick: () => { row.remove(); if (!$("#mItems").children.length) $("#mItems").append(manualLine()); },
+    }, "✕"));
+  return row;
+}
+
+function openManual(f) {
+  manualTarget = f;
+  $("#manualForm").reset();
+  $("#manualFile").textContent = t("man.file", { name: f.name, n: (f.receiptIds || []).length });
+  $("#mCurrency").value = settings.currency;
+  $("#mDocType").value = f.role === "statement" ? "other" : "receipt";
+  $("#mItems").replaceChildren(manualLine());
+  if (!$("#manualDialog").open) $("#manualDialog").showModal();
+  $("#mStore").focus();
+}
+
+/** Reads the manual-entry form. Returns null (after a toast) when something is invalid. */
+function readManualForm() {
+  const num = (v) => (String(v).trim() === "" ? null : parseAmount(v));
+  const items = [];
+  for (const row of $("#mItems").children) {
+    const desc = row.querySelector(".desc").value.trim();
+    const raw = row.querySelector(".amt").value;
+    if (!desc && !raw.trim()) continue;
+    const amt = num(raw);
+    if (amt == null || !Number.isFinite(amt)) { toast(t("t.nan")); return null; }
+    items.push({ description: desc || $("#mStore").value.trim(), line_total: amt });
+  }
+  const tax = num($("#mTax").value);
+  let total = num($("#mTotal").value);
+  if ((tax != null && !Number.isFinite(tax)) || (total != null && !Number.isFinite(total))) { toast(t("t.nan")); return null; }
+  if (total == null && items.length) total = round2(items.reduce((sum, it) => sum + it.line_total, 0) + (tax || 0));
+  if (total == null) { toast(t("t.manualEmpty")); return null; }
+  if (!items.length) items.push({ description: $("#mStore").value.trim(), line_total: round2(total - (tax || 0)) });
+  return { items, tax, total };
+}
+
+async function saveManual(again) {
+  const f = manualTarget;
+  if (!f) return false;
+  const parsed = readManualForm();
+  if (!parsed) return false;
+  const cur = ($("#mCurrency").value.trim() || settings.currency).toUpperCase();
+  const r = {
+    id: nextReceiptId(),
+    fileId: f.id, source: f.name, sha256: f.sha256, addedAt: f.addedAt,
+    extractedAt: new Date().toISOString(), model: null,
+    store_name: $("#mStore").value.trim(), store_address: null, date: $("#mDate").value || null, time: null,
+    currency: cur, receipt_number: null,
+    payment_method: $("#mPayment").value.trim() || null, source_ref: null,
+    items: parsed.items.map((it) => ({
+      description: it.description, quantity: null, unit_price: null, line_total: it.line_total, category: null,
+      likely_for_children: null, ai_suggestion: null, ai_type: null, exp_type: null, alloc: "review", split_pct: settings.splitDefault,
+    })),
+    subtotal: null, discount: null, tax: parsed.tax, tip: null, total: parsed.total, notes: null,
+    document_type: $("#mDocType").value, payer: f.payer || "me", declared: false, manual: true,
+    reviewed: false, note: $("#mNote").value.trim(), voided: false, voidReason: "",
+  };
+  receipts.push(r);
+  f.receiptIds = [...(f.receiptIds || []), r.id];
+  f.status = "done";
+  await saveReceipt(r);
+  await saveFile(f);
+  await log("manual_entry", r.id, t("lg.manual", { store: r.store_name, date: r.date || t("r.noDate"), total: fmtNum(r.total), cur, n: r.items.length, file: f.name }));
+  toast(t("t.manualSaved", { id: r.id }));
+  render();
+  if (again) openManual(f);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Statements: pick lines as expenses, or as proof of payment for a receipt/invoice
 // ---------------------------------------------------------------------------
 const stLabel = (f) => {
@@ -1120,6 +1218,7 @@ function buildReport() {
     if (tagged) L.push(t("r.kidsLine", { t: fmtMoney(a.kids, c) }) + (a.pending ? t("r.kidsPending", { n: a.pending }) : ""));
     if (r.payer === "other") L.push(`  ${t("badge.payerOther")}`);
     if (r.declared) L.push(`  ${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
+    if (r.manual) L.push(`  ${t("badge.manual")}`);
     if (r.paymentProof) L.push(`  ${t("r.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "", amt: fmtNum(r.paymentProof.amount), ref: r.paymentProof.ref || "" })}`);
     if (r.fromStatement) L.push(`  ${t("badge.fromStatement")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
     if (r.payment_method) L.push(t("r.paid", { p: r.payment_method }));
@@ -1238,7 +1337,7 @@ async function buildPack({ full = false } = {}) {
     : reportReceipts();
   const ids = new Set(list.map((r) => r.fileId));
   for (const r of list) if (r.paymentProof) ids.add(r.paymentProof.fileId);
-  const used = files.filter((f) => f.blob && (full ? f.status === "done" || ids.has(f.id) : ids.has(f.id)));
+  const used = files.filter((f) => f.blob && (full ? f.status === "done" || f.sensitive || ids.has(f.id) : ids.has(f.id)));
   // An evidence pack lists every original file with its fingerprint but leaves the files themselves
   // out (they stay on the phone, available on request). A full backup keeps them so it can be restored.
   const pf = full ? used : [];
@@ -1322,7 +1421,7 @@ async function restorePack(zipFile) {
     const hash = await sha256Hex(blob);
     if (hash !== meta.sha256) { badHash += 1; continue; }
     const { packPath, ...rest } = meta;
-    const rec = { ...rest, blob, status: "done" };
+    const rec = { ...rest, blob, status: rest.sensitive && !rest.receiptIds?.length ? "manual" : "done" };
     files.push(rec);
     await saveFile(rec);
     addedFiles += 1;
@@ -1689,6 +1788,7 @@ async function buildPdf(list = reportReceipts()) {
     text(meta.join("   ·   "), { size: 9, color: MUTED, gap: 2 });
     const flags = [
       r.declared && `${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`,
+      r.manual && t("badge.manual"),
       dupes.has(r.id) && t("badge.dupe", { ids: dupes.get(r.id).join(", ") }),
     ].filter(Boolean);
     if (flags.length) text(flags.join("   ·   "), { size: 9, color: WARN, gap: 2 });
@@ -1849,7 +1949,7 @@ async function sharePack() {
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
-const STATUS_LABEL = { pending: t("st.pending"), queued: t("st.queued"), working: t("st.working"), error: t("st.error") };
+const STATUS_LABEL = { manual: t("st.manual"), pending: t("st.pending"), queued: t("st.queued"), working: t("st.working"), error: t("st.error") };
 
 function thumbFor(f) {
   if (f.kind !== "image" || !f.blob) return null;
@@ -1868,11 +1968,19 @@ function render() {
     h("div", {},
       h("div", { class: "qname" }, f.name),
       h("div", { class: `qstatus ${f.status}` }, f.status === "error" ? f.error : STATUS_LABEL[f.status])),
-    h("button", {
-      class: "btn small ghost", "aria-label": t("remove", { name: f.name }),
-      disabled: f.status === "working" || f.status === "queued",
-      onclick: () => removeFile(f.id),
-    }, "✕"))));
+    h("div", { class: "qactions" },
+      f.sensitive && h("button", { class: "btn small primary", onclick: () => openManual(f) }, t("btn.manual")),
+      h("button", {
+        class: "btn small lock", "aria-pressed": String(!!f.sensitive),
+        title: t(f.sensitive ? "sens.off" : "sens.on"), "aria-label": t(f.sensitive ? "sens.off" : "sens.on"),
+        disabled: f.status === "working" || f.status === "queued",
+        onclick: () => toggleSensitive(f),
+      }, "🔒"),
+      h("button", {
+        class: "btn small ghost", "aria-label": t("remove", { name: f.name }),
+        disabled: f.status === "working" || f.status === "queued",
+        onclick: () => removeFile(f.id),
+      }, "✕")))));
   const doneCount = files.length - open.length;
   const last = store.get("lastBackup");
   const days = last ? Math.floor((Date.now() - Date.parse(last)) / 86_400_000) : null;
@@ -2055,6 +2163,7 @@ function renderReceipt(r, dupes) {
   if (dupes.has(r.id)) badges.push(h("span", { class: "badge bad" }, t("badge.dupe", { ids: dupes.get(r.id).join(", ") })));
   if (r.payer === "other") badges.push(h("span", { class: "badge other" }, t("badge.payerOther")));
   if (r.declared) badges.push(h("span", { class: "badge warn" }, t("badge.declared")));
+  if (r.manual) badges.push(h("span", { class: "badge manual" }, t("badge.manual")));
   if (r.fromStatement) badges.push(h("span", { class: "badge ok" }, t("badge.fromStatement")));
   if (r.paymentProof) badges.push(h("span", { class: "badge ok" }, t("badge.proof", { st: r.paymentProof.account, date: r.paymentProof.date || "" })));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, t("badge.mismatch", { a: fmtNum(expected), b: fmtNum(r.total) })));
@@ -2121,6 +2230,7 @@ function renderReceipt(r, dupes) {
         h("button", { class: "btn small", onclick: () => saveOriginal(r) }, t("btn.saveOrig")),
         !r.voided && h("button", { class: "btn small", onclick: () => togglePayer(r) }, t("btn.payer", { who: payerLabel(r) })),
         r.paymentProof && h("button", { class: "btn small", onclick: () => unlinkProof(r) }, t("btn.unlinkProof")),
+        r.manual && fileOf(r) && h("button", { class: "btn small", onclick: () => openManual(fileOf(r)) }, t("btn.manualAgain")),
         !r.voided && suggestableCount(r) > 0 && h("button", { class: "btn small", onclick: () => applySuggestions(r) }, t("btn.applyOne")),
         !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "kids") }, t("btn.allKids")),
         !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "not") }, t("btn.noneKids")),
@@ -2196,6 +2306,17 @@ document.querySelectorAll("[data-payer]").forEach((b) => b.addEventListener("cli
   renderPayerToggle();
 }));
 renderPayerToggle();
+
+$("#sensitiveToggle").checked = settings.intakeSensitive;
+$("#sensitiveToggle").addEventListener("change", (e) => store.set("intakeSensitive", e.target.checked ? "1" : ""));
+
+$("#mAddLine").addEventListener("click", () => { const row = manualLine(); $("#mItems").append(row); row.querySelector(".desc").focus(); });
+$("#manualForm").addEventListener("submit", async (e) => {
+  const action = e.submitter?.value;
+  if (action === "cancel") return;
+  e.preventDefault(); // keep the dialog open until the entry is valid
+  if (await saveManual(action === "again") && action !== "again") $("#manualDialog").close();
+});
 
 $("#statementInput").addEventListener("change", async (e) => {
   const list = [...e.target.files];
