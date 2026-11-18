@@ -286,3 +286,5 @@ tr.type-row .type-select { max-width: none; margin-top: 0; }
 .vf-block .type-select { margin-top: 4px; }
 .vf-block .actions { margin-top: 6px; }
 .chip-filter[hidden], .other-check[hidden] { display: none; }
+/* Sensitive file in the queue: its buttons go on their own row so the name and status keep the full width. */
+.queue li.wide-actions .qactions { grid-column: 1 / -1; }

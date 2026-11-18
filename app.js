@@ -2286,7 +2286,7 @@ function render() {
 
   // Intake queue: only files not yet extracted.
   const open = files.filter((f) => f.status !== "done");
-  $("#queue").replaceChildren(...open.map((f) => h("li", {},
+  $("#queue").replaceChildren(...open.map((f) => h("li", { class: f.sensitive ? "wide-actions" : null },
     thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" })
       : h("div", { class: "thumb", "aria-hidden": "true" }, f.role === "statement" ? "🏦" : f.kind === "pdf" ? "📄" : f.kind === "sheet" ? "📊" : "🧾"),
     h("div", {},
