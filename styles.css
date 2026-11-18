@@ -204,3 +204,6 @@ td.tagcell { width: 1%; white-space: nowrap; vertical-align: top; }
 #applyAllBtn { margin-bottom: 10px; width: 100%; }
 main > *, .card > * { min-width: 0; }
 .filters { max-width: 100%; }
+[hidden] { display: none !important; }
+.two-col > * { min-width: 0; }
+.field input[type="date"] { min-width: 0; max-width: 100%; }

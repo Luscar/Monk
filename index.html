@@ -17,88 +17,88 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>Receipt Mailer</h1>
-    <button id="settingsBtn" class="icon-btn" aria-label="Settings" title="Settings">
+    <h1 data-i18n="app.title">Receipt Mailer</h1>
+    <button id="settingsBtn" class="icon-btn" data-i18n-aria="settings" aria-label="Settings" title="Settings">
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3.3h-4l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z" transform="translate(-1 0)"/></svg>
     </button>
   </header>
 
   <main>
     <section id="setupNotice" class="card notice" hidden>
-      <strong>Add your Anthropic API key to get started.</strong>
-      <p>It is stored only on this device and sent only to api.anthropic.com.</p>
-      <button class="btn primary" data-open-settings>Open settings</button>
+      <strong data-i18n="setup.title">Add your Anthropic API key to get started.</strong>
+      <p data-i18n="setup.body">It is stored only on this device and sent only to api.anthropic.com.</p>
+      <button class="btn primary" data-open-settings data-i18n="setup.open">Open settings</button>
     </section>
 
     <section class="card">
-      <h2>1. Add receipts</h2>
+      <h2 data-i18n="add.title">1. Add receipts</h2>
       <div class="add-grid">
         <label class="btn big">
           <input id="cameraInput" type="file" accept="image/*" capture="environment" hidden>
-          <span class="emoji" aria-hidden="true">📷</span> Camera
+          <span class="emoji" aria-hidden="true">📷</span> <span data-i18n="add.camera">Camera</span>
         </label>
         <label class="btn big">
           <input id="galleryInput" type="file" accept="image/*" multiple hidden>
-          <span class="emoji" aria-hidden="true">🖼️</span> Gallery
+          <span class="emoji" aria-hidden="true">🖼️</span> <span data-i18n="add.gallery">Gallery</span>
         </label>
         <label class="btn big">
           <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple hidden>
-          <span class="emoji" aria-hidden="true">📄</span> PDF
+          <span class="emoji" aria-hidden="true">📄</span> <span data-i18n="add.pdf">PDF</span>
         </label>
       </div>
-      <p class="hint">Originals are kept on this device with a fingerprint (SHA-256) so you can prove they haven't been altered. Adding the same file twice is blocked.</p>
-      <div id="dropZone" class="drop-zone">…or drop files here</div>
+      <p class="hint" data-i18n="add.hint"></p>
+      <div id="dropZone" class="drop-zone" data-i18n="add.drop">…or drop files here</div>
       <ul id="queue" class="queue"></ul>
       <p id="processedCount" class="hint"></p>
       <div class="row">
-        <button id="processBtn" class="btn primary" disabled>Extract with Claude</button>
+        <button id="processBtn" class="btn primary" disabled data-i18n="process.idle">Extract with Claude</button>
       </div>
     </section>
 
     <section class="card" id="resultsCard" hidden>
-      <h2>2. Your receipts</h2>
-      <p class="hint">Just collecting? Nothing else to do. When you want to separate the kids' share, tap <b>Tag</b> on a line to cycle <b>Kids → Split % → Not kids</b>, or use Claude's suggestions below. Every change is logged.</p>
+      <h2 data-i18n="results.title">2. Your receipts</h2>
+      <p class="hint" data-i18n-html="results.hint"></p>
       <div id="totals" class="totals"></div>
       <button id="applyAllBtn" class="btn small" hidden></button>
       <div class="filters" role="tablist">
-        <button class="chip-filter" data-filter="all">All</button>
-        <button class="chip-filter" data-filter="untagged">Untagged</button>
-        <button class="chip-filter" data-filter="unverified">Not verified</button>
-        <button class="chip-filter" data-filter="dupe">Possible duplicates</button>
-        <button class="chip-filter" data-filter="void">Voided</button>
+        <button class="chip-filter" data-filter="all" data-label-key="filter.all"></button>
+        <button class="chip-filter" data-filter="untagged" data-label-key="filter.untagged"></button>
+        <button class="chip-filter" data-filter="unverified" data-label-key="filter.unverified"></button>
+        <button class="chip-filter" data-filter="dupe" data-label-key="filter.dupe"></button>
+        <button class="chip-filter" data-filter="void" data-label-key="filter.void"></button>
       </div>
-      <input id="search" class="search" type="search" placeholder="Search store, item, ID…">
+      <input id="search" class="search" type="search" data-i18n-ph="search.ph">
       <div id="receipts"></div>
       <details class="preview">
-        <summary>Change history (audit log)</summary>
+        <summary data-i18n="history">Change history (audit log)</summary>
         <div id="history"></div>
       </details>
     </section>
 
     <section class="card" id="sendCard" hidden>
-      <h2>3. Report &amp; send</h2>
+      <h2 data-i18n="send.title">3. Report &amp; send</h2>
       <div class="two-col">
-        <label class="field"><span>From date</span><input id="periodFrom" type="date"></label>
-        <label class="field"><span>To date</span><input id="periodTo" type="date"></label>
+        <label class="field"><span data-i18n="send.from">From date</span><input id="periodFrom" type="date"></label>
+        <label class="field"><span data-i18n="send.to">To date</span><input id="periodTo" type="date"></label>
       </div>
       <label class="field">
-        <span>Email to</span>
+        <span data-i18n="send.emailTo">Email to</span>
         <input id="emailTo" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
       </label>
       <label class="field">
-        <span>Subject</span>
+        <span data-i18n="send.subject">Subject</span>
         <input id="emailSubject" type="text">
       </label>
       <div class="row wrap">
-        <button id="emailBtn" class="btn primary">Open in Mail</button>
-        <button id="shareBtn" class="btn">Share evidence pack</button>
-        <button id="zipBtn" class="btn">Download evidence pack (.zip)</button>
-        <button id="csvBtn" class="btn">Download CSV</button>
-        <button id="copyBtn" class="btn">Copy report</button>
+        <button id="emailBtn" class="btn primary" data-i18n="btn.email">Open in Mail</button>
+        <button id="shareBtn" class="btn" data-i18n="btn.share">Share evidence pack</button>
+        <button id="zipBtn" class="btn" data-i18n="btn.zip">Download evidence pack (.zip)</button>
+        <button id="csvBtn" class="btn" data-i18n="btn.csv">Download CSV</button>
+        <button id="copyBtn" class="btn" data-i18n="btn.copy">Copy report</button>
       </div>
-      <p class="hint">The evidence pack holds the report, an item-level CSV, the audit log, a fingerprint manifest, every original file, and a stamped copy of each photo (receipt ID + fingerprint printed on it), all named by receipt ID. It covers the dates above. For a full backup, use Settings.</p>
+      <p class="hint" data-i18n="send.hint"></p>
       <details class="preview">
-        <summary>Preview report</summary>
+        <summary data-i18n="send.preview">Preview report</summary>
         <pre id="emailPreview"></pre>
       </details>
     </section>
@@ -106,56 +106,64 @@
 
   <dialog id="settingsDialog">
     <form method="dialog" class="settings">
-      <h2>Settings</h2>
+      <h2 data-i18n="settings">Settings</h2>
       <label class="field">
-        <span>Anthropic API key</span>
-        <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
-      </label>
-      <label class="field">
-        <span>Model</span>
-        <select id="model">
-          <option value="claude-opus-5-5">Claude Opus 5.5 (most accurate)</option>
-          <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (balanced)</option>
-          <option value="claude-haiku-5-5">Claude Haiku 5.5 (cheapest)</option>
+        <span data-i18n="set.lang">Language</span>
+        <select id="langSelect">
+          <option value="auto" data-i18n="lang.auto">Automatic (phone setting)</option>
+          <option value="en">English</option>
+          <option value="fr">Français</option>
         </select>
       </label>
       <label class="field">
-        <span>About the children (helps Claude suggest tags, e.g. "2 kids: girl 6, boy 10")</span>
+        <span data-i18n="set.key">Anthropic API key</span>
+        <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
+      </label>
+      <label class="field">
+        <span data-i18n="set.model">Model</span>
+        <select id="model">
+          <option value="claude-opus-5-5" data-i18n="model.opus">Claude Opus 5.5 (most accurate)</option>
+          <option value="claude-sonnet-5-5" data-i18n="model.sonnet">Claude Sonnet 5.5 (balanced)</option>
+          <option value="claude-haiku-5-5" data-i18n="model.haiku">Claude Haiku 5.5 (cheapest)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span data-i18n="set.kids"></span>
         <textarea id="kidsContext" rows="2"></textarea>
       </label>
       <label class="field">
-        <span>Default split % for shared items (e.g. groceries)</span>
+        <span data-i18n="set.split"></span>
         <input id="splitDefault" type="number" min="0" max="100" step="1" placeholder="50">
       </label>
       <label class="field">
-        <span>Default recipient</span>
+        <span data-i18n="set.recipient">Default recipient</span>
         <input id="defaultEmail" type="email" inputmode="email" placeholder="you@example.com">
       </label>
       <label class="field">
-        <span>Your currency (used when a receipt doesn't show one)</span>
-        <input id="defaultCurrency" type="text" maxlength="3" placeholder="USD">
+        <span data-i18n="set.currency"></span>
+        <input id="defaultCurrency" type="text" maxlength="3">
       </label>
       <label class="check">
         <input id="autoTag" type="checkbox">
-        <span>Tag kids' items automatically with Claude's suggestions<br><small>Leave off if you just want to collect for now. Suggestions are saved either way and can be applied later.</small></span>
+        <span data-i18n-html="set.autotag"></span>
       </label>
-      <p class="hint">Your key is saved in this browser only. Use a key with a spend limit.</p>
+      <p class="hint" data-i18n="set.keyhint"></p>
       <div class="row">
-        <button value="save" class="btn primary">Save</button>
-        <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
+        <button value="save" class="btn primary" data-i18n="set.save">Save</button>
+        <button value="cancel" class="btn ghost" formnovalidate data-i18n="set.cancel">Cancel</button>
       </div>
       <hr>
-      <h3>Backup</h3>
-      <p class="hint">Everything lives only on this device. Back up regularly (e.g. email it to yourself or save it to iCloud/Google Drive). A backup can be restored on a new phone, and the fingerprints are re-checked when it is.</p>
+      <h3 data-i18n="backup.title">Backup</h3>
+      <p class="hint" data-i18n="backup.hint"></p>
       <div class="row wrap">
-        <button type="button" id="backupBtn" class="btn">Back up everything (.zip)</button>
+        <button type="button" id="backupBtn" class="btn" data-i18n="backup.btn">Back up everything (.zip)</button>
         <label class="btn">
           <input id="restoreInput" type="file" accept=".zip,application/zip" hidden>
-          Restore from backup…
+          <span data-i18n="restore.btn">Restore from backup…</span>
         </label>
       </div>
       <hr>
-      <button type="button" id="wipeBtn" class="btn ghost danger">Erase all data on this device…</button>
+      <button type="button" id="wipeBtn" class="btn ghost danger" data-i18n="wipe.btn">Erase all data on this device…</button>
     </form>
   </dialog>
 

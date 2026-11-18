@@ -43,6 +43,17 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 - **Full backup & restore** (Settings): one .zip with everything. Restoring on a new phone re-checks every fingerprint, merges without duplicates, and carries on with the ID numbering. The app reminds you when the last backup is more than 7 days old.
 - **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json`, `originals/` and `stamped/`, named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
 
+## Language
+
+The app is in **English or French**, following the phone's language (any `fr-*` setting gives French). You can override it in Settings → Language. In French:
+- amounts are shown the French way (`1 271,50 $`) and can be typed with a comma
+- the default currency is guessed from the phone's region (e.g. CAD for fr-CA, EUR for fr-FR)
+- the report, email, CSV headers, file names and audit log are all in French
+- the CSV uses `;` separators so French-language Excel opens it in proper columns
+- Claude writes categories and notes in French (item descriptions stay as printed)
+
+Receipt IDs, dates (YYYY-MM-DD) and fingerprints are the same in both languages.
+
 ## Notes
 
 - **Model**: defaults to Claude Opus 5.5 (most accurate on faded/crumpled receipts). Sonnet 5.5 and Haiku 5.5 are cheaper options in Settings. Opus/Sonnet requests opt into server-side refusal fallbacks.
@@ -58,6 +69,7 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 | File | Purpose |
 |---|---|
 | `index.html`, `styles.css` | UI |
+| `i18n.js` | English/French text and language detection |
 | `app.js` | File intake, image prep, Claude calls (structured JSON output), totals, email/CSV |
 | `vendor/anthropic-sdk.js` | Bundled official `@anthropic-ai/sdk` 1.10.0 (ESM, browser) |
 | `sw.js`, `manifest.webmanifest`, `icons/` | PWA install + offline shell |
