@@ -45,7 +45,17 @@
           <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple hidden>
           <span class="emoji" aria-hidden="true">📄</span> <span data-i18n="add.pdf">PDF</span>
         </label>
+        <label class="btn big">
+          <input id="sheetInput" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple hidden>
+          <span class="emoji" aria-hidden="true">📊</span> <span data-i18n="add.sheet">Excel grid</span>
+        </label>
       </div>
+      <div class="payer-toggle" role="group">
+        <span data-i18n="payer.label">Paid by:</span>
+        <button type="button" data-payer="me" data-i18n="payer.me">Me</button>
+        <button type="button" data-payer="other" data-i18n="payer.other">Other parent</button>
+      </div>
+      <p class="hint" data-i18n="add.payerHint"></p>
       <p class="hint" data-i18n="add.hint"></p>
       <div id="dropZone" class="drop-zone" data-i18n="add.drop">…or drop files here</div>
       <ul id="queue" class="queue"></ul>
@@ -100,6 +110,7 @@
         <button id="csvBtn" class="btn" data-i18n="btn.csv">Download Excel (.xlsx)</button>
         <button id="packShareBtn" class="btn" data-i18n="btn.share">Share evidence pack (.zip)</button>
         <button id="zipBtn" class="btn" data-i18n="btn.zip">Download evidence pack (.zip)</button>
+        <button id="richCopyBtn" class="btn" data-i18n="btn.richCopy">Copy coloured summary</button>
         <button id="copyBtn" class="btn" data-i18n="btn.copy">Copy summary</button>
         </div>
       </details>
@@ -149,6 +160,10 @@
       <label class="field">
         <span data-i18n="set.currency"></span>
         <input id="defaultCurrency" type="text" maxlength="3">
+      </label>
+      <label class="field">
+        <span data-i18n="set.types"></span>
+        <textarea id="expTypes" rows="5"></textarea>
       </label>
       <label class="check">
         <input id="autoTag" type="checkbox">

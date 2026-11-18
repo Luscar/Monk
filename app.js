@@ -1,7 +1,7 @@
 import Anthropic from "./vendor/anthropic-sdk.js";
 import { db } from "./db.js";
 import { makeZip, readZip } from "./zip.js";
-import { makeXlsx } from "./xlsx.js";
+import { makeXlsx, readXlsx, readCsv, sheetsToText } from "./xlsx.js";
 import { t, lang, locale, regionCurrency, actionLabel, applyStatic } from "./i18n.js";
 
 // ---------------------------------------------------------------------------
@@ -22,6 +22,15 @@ const settings = {
   get defaultEmail() { return store.get("defaultEmail"); },
   get currency() { return (store.get("defaultCurrency") || regionCurrency()).toUpperCase(); },
   get autoTag() { return store.get("autoTag") === "1"; },
+  /** Expense types from Settings, one per line: "Name : examples". */
+  get expTypes() {
+    const raw = store.get("expTypes").trim() || t("types.default");
+    return raw.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+      const at = l.indexOf(":");
+      return at < 0 ? { name: l, examples: "" } : { name: l.slice(0, at).trim(), examples: l.slice(at + 1).trim() };
+    }).filter((x) => x.name);
+  },
+  get intakePayer() { return store.get("intakePayer") === "other" ? "other" : "me"; },
   get kidsContext() { return store.get("kidsContext").trim(); },
   get splitDefault() {
     const raw = store.get("splitDefault").trim();
@@ -41,6 +50,10 @@ const MAX_PDF_BYTES = 25 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 const nullable = (type) => ({ anyOf: [{ type }, { type: "null" }] });
 
+/** Built per request because the expense-type list comes from Settings. */
+const receiptSchema = () => JSON.parse(JSON.stringify(RECEIPT_SCHEMA), (k, v) =>
+  (k === "expense_type" ? { type: "string", enum: [...settings.expTypes.map((x) => x.name), "unknown"] } : v));
+
 const RECEIPT_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -54,10 +67,11 @@ const RECEIPT_SCHEMA = {
         required: [
           "store_name", "store_address", "date", "time", "currency",
           "receipt_number", "payment_method", "items",
-          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type",
+          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type", "source_ref",
         ],
         properties: {
           store_name: { type: "string" },
+          source_ref: { ...nullable("string"), description: "Spreadsheets only: sheet and row(s), e.g. 'Feuil1 L12'. null for photos/PDFs" },
           store_address: nullable("string"),
           date: { ...nullable("string"), description: "ISO date YYYY-MM-DD" },
           time: { ...nullable("string"), description: "24h HH:MM" },
@@ -69,7 +83,7 @@ const RECEIPT_SCHEMA = {
             items: {
               type: "object",
               additionalProperties: false,
-              required: ["description", "quantity", "unit_price", "line_total", "category", "likely_for_children"],
+              required: ["description", "quantity", "unit_price", "line_total", "category", "likely_for_children", "expense_type"],
               properties: {
                 description: { type: "string" },
                 quantity: nullable("number"),
@@ -77,6 +91,7 @@ const RECEIPT_SCHEMA = {
                 line_total: { type: "number" },
                 category: { ...nullable("string"), description: "e.g. Groceries, Clothing, School, Medical, Fuel, Dining" },
                 likely_for_children: { type: "string", enum: ["yes", "no", "unsure"] },
+                expense_type: "placeholder",
               },
             },
           },
@@ -111,6 +126,8 @@ Rules:
 - notes: null in the normal case. Only write a note when something could change how the amounts, date or store should be read (ambiguous date, illegible amount, total that doesn't add up, a second receipt cut off in the photo). Then ONE short sentence, max ~20 words. Never restate amounts, taxes, addresses, tracking numbers or other details already captured or not needed, and don't guess who an item is for (that's what likely_for_children is for).
 - document_type: "receipt" if it shows a completed payment (e.g. paid, card approved, change given); "invoice" for a bill, amount due, quote or statement without proof of payment; otherwise "other".
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
+- expense_type is also only a suggestion: for items that are (or may be) for the children, pick the type from the user's list whose examples fit best; use "unknown" when unsure or when the item is not for the children.
+- Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12"). Skip headers, totals, subtotals and empty rows. Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
 - If the file contains no receipt at all, return an empty receipts array.`;
 
 // ---------------------------------------------------------------------------
@@ -169,7 +186,7 @@ function h(tag, attrs = {}, ...children) {
     else if (k === "value") el.value = v;
     else el.setAttribute(k, v === true ? "" : v);
   }
-  for (const c of children.flat()) {
+  for (const c of children.flat(Infinity)) {
     if (c == null || c === false) continue;
     el.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
@@ -207,6 +224,11 @@ const curOf = (r) => r.currency || settings.currency;
 // ---------------------------------------------------------------------------
 // File intake
 // ---------------------------------------------------------------------------
+function isSheet(file) {
+  return /\.(xlsx|csv)$/i.test(file.name)
+    || ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"].includes(file.type);
+}
+
 function isPdf(file) {
   return file.type === "application/pdf" || /\.pdf$/i.test(file.name);
 }
@@ -218,8 +240,9 @@ async function sha256Hex(blob) {
 
 async function addFiles(fileList) {
   for (const file of [...fileList]) {
-    const kind = isPdf(file) ? "pdf"
+    const kind = isPdf(file) ? "pdf" : isSheet(file) ? "sheet"
       : file.type.startsWith("image/") || /\.(heic|heif)$/i.test(file.name) ? "image" : null;
+    if (/\.(xls|numbers|ods)$/i.test(file.name)) { toast(t("t.oldSheet", { name: file.name }), 6000); continue; }
     if (!kind) { toast(t("t.unsupported", { name: file.name })); continue; }
     if (kind === "pdf" && file.size > MAX_PDF_BYTES) { toast(t("t.pdfTooBig", { name: file.name }), 4000); continue; }
 
@@ -242,6 +265,7 @@ async function addFiles(fileList) {
       blob: file,
       status: "pending",
       receiptIds: [],
+      payer: settings.intakePayer,
     };
     files.push(rec);
     await saveFile(rec);
@@ -298,7 +322,12 @@ function makeClient() {
 
 async function extract(client, file) {
   let source;
-  if (file.kind === "pdf") {
+  if (file.kind === "sheet") {
+    const sheets = /\.csv$/i.test(file.name) || file.type === "text/csv"
+      ? readCsv(await file.blob.text())
+      : await readXlsx(file.blob);
+    source = { type: "text", text: `<spreadsheet name="${file.name}">\n${sheetsToText(sheets)}\n</spreadsheet>` };
+  } else if (file.kind === "pdf") {
     source = {
       type: "document",
       source: { type: "base64", media_type: "application/pdf", data: await readAsBase64(file.blob) },
@@ -309,6 +338,10 @@ async function extract(client, file) {
   }
 
   const kids = settings.kidsContext ? `\nAbout the children: ${settings.kidsContext}` : "";
+  const types = `\nExpense types for children's items (expense_type):\n${settings.expTypes.map((x) => `- ${x.name}${x.examples ? `: ${x.examples}` : ""}`).join("\n")}`;
+  const what = file.kind === "sheet"
+    ? `This spreadsheet lists expenses${file.payer === "other" ? " paid by the children's other parent" : ""}. Turn each expense row into an entry`
+    : `Extract every receipt in this ${file.kind === "pdf" ? "PDF" : "image"}`;
   const model = settings.model;
   const params = {
     model,
@@ -316,7 +349,7 @@ async function extract(client, file) {
     system: SYSTEM_PROMPT,
     output_config: {
       effort: "medium",
-      format: { type: "json_schema", schema: RECEIPT_SCHEMA },
+      format: { type: "json_schema", schema: receiptSchema() },
     },
     messages: [
       {
@@ -325,7 +358,7 @@ async function extract(client, file) {
           source,
           {
             type: "text",
-            text: `Extract every receipt in this ${file.kind === "pdf" ? "PDF" : "image"} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}${t("claude.lang") ? `\n${t("claude.lang")}` : ""}`,
+            text: `${what} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}${types}${t("claude.lang") ? `\n${t("claude.lang")}` : ""}`,
           },
         ],
       },
@@ -364,6 +397,9 @@ function describeError(err) {
 }
 
 const SUGGESTION_TO_ALLOC = { yes: "kids", no: "not", unsure: "review" };
+const validType = (name) => (name && settings.expTypes.some((x) => x.name === name) ? name : null);
+const isKidsLine = (it) => it.alloc === "kids" || it.alloc === "split";
+const payerLabel = (r) => t(r.payer === "other" ? "payer.other" : "payer.me");
 
 async function createReceipts(file, extracted) {
   const ids = [];
@@ -377,12 +413,19 @@ async function createReceipts(file, extracted) {
       addedAt: file.addedAt,
       extractedAt: new Date().toISOString(),
       model: settings.model,
-      items: (x.items || []).map((it) => ({
-        ...it,
-        ai_suggestion: it.likely_for_children,
-        alloc: settings.autoTag ? SUGGESTION_TO_ALLOC[it.likely_for_children] || "review" : "review",
-        split_pct: settings.splitDefault,
-      })),
+      payer: file.payer || "me",
+      declared: file.kind === "sheet",
+      items: (x.items || []).map((it) => {
+        const alloc = settings.autoTag ? SUGGESTION_TO_ALLOC[it.likely_for_children] || "review" : "review";
+        return {
+          ...it,
+          ai_suggestion: it.likely_for_children,
+          ai_type: validType(it.expense_type),
+          exp_type: settings.autoTag && (alloc === "kids" || alloc === "split") ? validType(it.expense_type) : null,
+          alloc,
+          split_pct: settings.splitDefault,
+        };
+      }),
       reviewed: false,
       note: "",
       voided: false,
@@ -546,8 +589,31 @@ async function setAlloc(r, idx, alloc) {
   if (it.alloc === alloc) return;
   const from = it.alloc;
   it.alloc = alloc;
+  // First time a line becomes a kids' line, take Claude's suggested type (logged with the change).
+  const autoType = isKidsLine(it) && !it.exp_type && validType(it.ai_type);
+  if (autoType) it.exp_type = autoType;
   await saveReceipt(r);
-  await log("tag_changed", r.id, t("lg.tag", { desc: it.description, from: ALLOC_LABEL[from], to: `${ALLOC_LABEL[alloc]}${alloc === "split" ? ` (${it.split_pct}%)` : ""}` }));
+  await log("tag_changed", r.id, t("lg.tag", { desc: it.description, from: ALLOC_LABEL[from], to: `${ALLOC_LABEL[alloc]}${alloc === "split" ? ` (${it.split_pct}%)` : ""}` })
+    + (autoType ? ` · ${t("lg.typeAuto", { type: autoType })}` : ""));
+  render();
+}
+
+async function setType(r, idx, value) {
+  const it = r.items[idx];
+  const to = value || null;
+  if ((it.exp_type || null) === to) return;
+  const from = it.exp_type;
+  it.exp_type = to;
+  await saveReceipt(r);
+  await log("type_changed", r.id, t("lg.type", { desc: it.description, from: from || "—", to: to || "—" }));
+  render();
+}
+
+async function togglePayer(r) {
+  const from = payerLabel(r);
+  r.payer = r.payer === "other" ? "me" : "other";
+  await saveReceipt(r);
+  await log("payer_changed", r.id, `${from} → ${payerLabel(r)}`);
   render();
 }
 
@@ -647,14 +713,20 @@ async function toggleReviewed(r) {
 function applySuggestionsTo(r) {
   let n = 0;
   for (const it of r.items) {
+    if ((it.line_total || 0) < 0) continue; // discount lines follow the item above them
+    let changed = false;
     const to = SUGGESTION_TO_ALLOC[it.ai_suggestion];
-    if ((it.line_total || 0) >= 0 && it.alloc === "review" && to && to !== "review") { it.alloc = to; n += 1; }
+    if (it.alloc === "review" && to && to !== "review") { it.alloc = to; changed = true; }
+    if (isKidsLine(it) && !it.exp_type && validType(it.ai_type)) { it.exp_type = it.ai_type; changed = true; }
+    if (changed) n += 1;
   }
   return n;
 }
 
 const suggestableCount = (r) => r.voided ? 0
-  : r.items.filter((it) => (it.line_total || 0) >= 0 && it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")).length;
+  : r.items.filter((it) => (it.line_total || 0) >= 0 && (
+    (it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no"))
+    || (isKidsLine(it) && !it.exp_type && validType(it.ai_type)))).length;
 
 async function applySuggestions(r) {
   const n = applySuggestionsTo(r);
@@ -875,14 +947,16 @@ function buildReport() {
     L.push("");
     L.push(`${r.id} | ${r.date || t("r.noDate")}${r.time ? ` ${r.time}` : ""} | ${r.store_name || t("unknownStore")} | ${fmtMoney(a.total, c)}${r.reviewed ? t("r.verified") : ""}`);
     if (tagged) L.push(t("r.kidsLine", { t: fmtMoney(a.kids, c) }) + (a.pending ? t("r.kidsPending", { n: a.pending }) : ""));
+    if (r.payer === "other") L.push(`  ${t("badge.payerOther")}`);
+    if (r.declared) L.push(`  ${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`);
     if (r.document_type === "invoice") L.push(t("r.invoice"));
     if (r.payment_method) L.push(t("r.paid", { p: r.payment_method }));
     for (const it of a.items) {
-      const tag = !tagged ? "-"
+      const tag = (!tagged ? "-"
         : it.linked ? "  ↳"
         : it.alloc === "kids" ? t("r.tagKids")
         : it.alloc === "split" ? t("r.tagSplit", { p: it.split_pct })
-        : it.alloc === "not" ? t("r.tagNot") : "[ ]";
+        : it.alloc === "not" ? t("r.tagNot") : "[ ]") + (isKidsLine(it) && !it.linked && it.exp_type ? ` {${it.exp_type}}` : "");
       const qty = it.quantity != null && it.quantity !== 1 ? `${fmtQty(it.quantity)} x ` : "";
       L.push(`   ${tag} ${qty}${it.description} = ${fmtNum(it.line_total)}`);
     }
@@ -923,10 +997,11 @@ function itemRows(list) {
     const a = allocation(r);
     for (const it of a.items.length ? a.items : [null]) {
       rows.push([
-        r.id, r.date, r.time, r.store_name, docLabel(r), it?.description, it?.category, it?.quantity, it?.unit_price, it?.line_total,
-        it ? `${it.linked ? "↳ " : ""}${ALLOC_LABEL[it.alloc]}` : "", it?.alloc === "split" ? it.split_pct : "", it ? itemKidsAmount(it, a.factor) : "",
-        it?.ai_suggestion ? t(`sug.${it.ai_suggestion}`) : "", a.total, a.kids, curOf(r), r.payment_method, yesNo(r.reviewed),
-        yesNo(r.voided), r.voidReason, r.note, r.source, r.sha256, r.addedAt,
+        r.id, r.date, r.time, r.store_name, docLabel(r), payerLabel(r), it?.description, it?.category, it?.quantity, it?.unit_price, it?.line_total,
+        it ? `${it.linked ? "↳ " : ""}${ALLOC_LABEL[it.alloc]}` : "", it && isKidsLine(it) ? it.exp_type || "" : "",
+        it?.alloc === "split" ? it.split_pct : "", it ? itemKidsAmount(it, a.factor) : "",
+        it?.ai_suggestion ? t(`sug.${it.ai_suggestion}`) : "", it?.ai_type || "", a.total, a.kids, curOf(r), r.payment_method, yesNo(r.reviewed),
+        yesNo(r.voided), r.voidReason, yesNo(r.declared), r.source_ref, r.note, r.source, r.sha256, r.addedAt,
       ]);
     }
   }
@@ -939,9 +1014,9 @@ function receiptRows(list) {
   for (const r of list) {
     const a = allocation(r);
     rows.push([
-      r.id, r.date, r.time, r.store_name, docLabel(r), curOf(r), r.subtotal, r.tax, r.discount, r.tip, a.total,
-      a.kids, a.not, a.review, r.payment_method, yesNo(r.reviewed), yesNo(r.voided), r.voidReason, r.note, r.notes,
-      r.source, r.sha256, r.addedAt,
+      r.id, r.date, r.time, r.store_name, docLabel(r), payerLabel(r), curOf(r), r.subtotal, r.tax, extraDiscount(r) || null, r.tip, a.total,
+      a.kids, a.not, a.review, r.payment_method, yesNo(r.reviewed), yesNo(r.voided), r.voidReason, yesNo(r.declared), r.source_ref,
+      r.note, r.notes, r.source, r.sha256, r.addedAt,
     ]);
   }
   return rows;
@@ -953,8 +1028,8 @@ function buildItemsCsv(list = reportReceipts()) {
 
 function buildXlsx(list = reportReceipts()) {
   return makeXlsx([
-    { name: t("xl.sheetReceipts"), rows: receiptRows(list), money: [6, 7, 8, 9, 10, 11, 12, 13], widths: { 21: 20 } },
-    { name: t("xl.sheetItems"), rows: itemRows(list), money: [8, 9, 12, 14, 15], widths: { 23: 20 } },
+    { name: t("xl.sheetReceipts"), rows: receiptRows(list), money: [7, 8, 9, 10, 11, 12, 13, 14], widths: { 24: 20 } },
+    { name: t("xl.sheetItems"), rows: itemRows(list), money: [9, 10, 14, 17, 18], widths: { 28: 20 } },
   ]);
 }
 
@@ -1103,6 +1178,23 @@ function monthRows(active) {
     .map(([k, v]) => { const [month, c] = k.split("|"); return { month, c, ...v }; });
 }
 
+/** Kids' share by expense type and by who paid (only lines counted for the children). */
+function typeRows(active) {
+  const m = new Map();
+  for (const r of active) {
+    const a = allocation(r);
+    for (const it of a.items) {
+      const amt = itemKidsAmount(it, a.factor);
+      if (!amt) continue;
+      const key = `${it.exp_type || t("type.none")}|${curOf(r)}`;
+      const row = m.get(key) || { type: it.exp_type || t("type.none"), c: curOf(r), me: 0, other: 0 };
+      row[r.payer === "other" ? "other" : "me"] += amt;
+      m.set(key, row);
+    }
+  }
+  return [...m.values()].map((x) => ({ ...x, me: round2(x.me), other: round2(x.other), total: round2(x.me + x.other) }));
+}
+
 /** Things a reader should know before relying on the totals. */
 function checkLines(list) {
   const active = list.filter((r) => !r.voided);
@@ -1114,6 +1206,8 @@ function checkLines(list) {
   if (unverified) out.push(t("chk.unverified", { n: unverified }));
   if (invoices.length) out.push(t("chk.invoice", { n: invoices.length, ids: invoices.map((r) => r.id).join(", ") }));
   if (dupIds.length) out.push(t("chk.dupe", { ids: dupIds.join(", ") }));
+  const declared = active.filter((r) => r.declared).length;
+  if (declared) out.push(t("chk.declared", { n: declared }));
   const noDate = active.filter((r) => !r.date).length;
   if (noDate) out.push(t("chk.noDate", { n: noDate }));
   const voided = list.length - active.length;
@@ -1121,40 +1215,154 @@ function checkLines(list) {
   return out;
 }
 
-/** The email body: a few lines a person can read on a phone. Details go in the attachments. */
-function buildSummary({ attached = true } = {}) {
+/** Figures shared by the plain-text and the coloured summary. */
+function summaryData() {
   const list = reportReceipts();
   const active = list.filter((r) => !r.voided);
   const totals = totalsFor(active);
   const anyTagged = active.some(isTagged);
-  const multiCur = Object.keys(totals).length > 1;
-  const L = [t(anyTagged ? "s.titleKids" : "s.title"), t("r.period", { p: periodLabel() }), ""];
-  for (const [c, tot] of Object.entries(totals)) {
-    if (multiCur) L.push(`— ${c} —`);
-    if (anyTagged) L.push(t("s.kids", { t: fmtMoney(tot.kids, c) }));
-    L.push(t("s.total", { t: fmtMoney(tot.total, c), n: tot.count }));
-    if (anyTagged) {
-      L.push(t("s.not", { t: fmtMoney(tot.not, c) }));
-      const untaggedReceipts = active.filter((r) => curOf(r) === c && allocation(r).pending).length;
-      if (tot.pending) L.push(t("s.untagged", { t: fmtMoney(tot.review, c), n: untaggedReceipts }));
+  const curs = Object.entries(totals).map(([c, tot]) => ({
+    c, ...tot,
+    untaggedReceipts: active.filter((r) => curOf(r) === c && allocation(r).pending).length,
+  }));
+  return {
+    title: t(anyTagged ? "s.titleKids" : "s.title"),
+    period: periodLabel(),
+    anyTagged,
+    multiCur: curs.length > 1,
+    curs,
+    months: monthRows(active),
+    checks: checkLines(list),
+    types: active.some((r) => r.payer === "other") || active.some((r) => r.items.some((it) => it.exp_type)) ? typeRows(active) : [],
+    hasOther: active.some((r) => r.payer === "other"),
+  };
+}
+
+/**
+ * The email body as plain text. Gmail on iPhone drops line breaks from shared text, so every line
+ * ends with a period or starts with a bullet: it reads correctly whether the breaks survive or not.
+ */
+function buildSummary({ attached = true } = {}) {
+  const d = summaryData();
+  const L = [`${d.title} — ${d.period}.`, ""];
+  for (const x of d.curs) {
+    const cur = d.multiCur ? ` (${x.c})` : "";
+    if (d.anyTagged) L.push(`${t("s.kids", { t: fmtMoney(x.kids, x.c) })}${cur}.`);
+    L.push(`${t("s.total", { t: fmtMoney(x.total, x.c), n: x.count })}${cur}.`);
+    if (d.anyTagged) {
+      L.push(`${t("s.not", { t: fmtMoney(x.not, x.c) })}.`);
+      if (x.pending) L.push(`${t("s.untagged", { t: fmtMoney(x.review, x.c), n: x.untaggedReceipts })}.`);
     }
     L.push("");
   }
-  const months = monthRows(active);
-  if (months.length) {
-    L.push(t(anyTagged ? "s.byMonthKids" : "s.byMonth"));
-    for (const m of months) {
-      const cur = multiCur ? ` (${m.c})` : "";
-      L.push(anyTagged
-        ? `  ${m.month} : ${fmtMoney(m.kids, m.c)} / ${fmtMoney(m.total, m.c)}${cur}`
-        : `  ${m.month} : ${fmtMoney(m.total, m.c)}${cur}`);
+  if (d.months.length) {
+    L.push(t(d.anyTagged ? "s.byMonthKids" : "s.byMonth"));
+    for (const m of d.months) {
+      const cur = d.multiCur ? ` (${m.c})` : "";
+      L.push(d.anyTagged
+        ? `• ${m.month} : ${fmtMoney(m.kids, m.c)} / ${fmtMoney(m.total, m.c)}${cur};`
+        : `• ${m.month} : ${fmtMoney(m.total, m.c)}${cur};`);
     }
     L.push("");
   }
-  const checks = checkLines(list);
-  if (checks.length) L.push(t("s.checks"), ...checks.map((x) => `  • ${x}`), "");
+  if (d.types.length) {
+    L.push(t("s.byType"));
+    for (const x of d.types) {
+      const who = d.hasOther ? ` (${t("payer.me")} ${fmtMoney(x.me, x.c)} · ${t("payer.other")} ${fmtMoney(x.other, x.c)})` : "";
+      L.push(`• ${x.type} : ${fmtMoney(x.total, x.c)}${who};`);
+    }
+    L.push("");
+  }
+  if (d.checks.length) L.push(t("s.checks"), ...d.checks.map((x) => `• ${x};`), "");
   if (attached) L.push(t("s.attached"));
   return L.join("\n").trim();
+}
+
+/** The same summary with colours, for pasting into an email (inline styles: mail apps drop <style>). */
+function buildSummaryHtml() {
+  const d = summaryData();
+  const e = (v) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const FONT = "font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+  const row = (label, value, strong = false) =>
+    `<tr><td style="padding:6px 0;color:#5d6b68;font-size:14px;border-bottom:1px solid #e5ebe9">${e(label)}</td>`
+    + `<td style="padding:6px 0;text-align:right;font-size:14px;border-bottom:1px solid #e5ebe9;${strong ? "font-weight:700;" : ""}">${e(value)}</td></tr>`;
+  let h = `<div style="${FONT}color:#17201e;max-width:560px">`;
+  h += `<div style="font-size:22px;font-weight:700;margin:0">${e(d.title)}</div>`;
+  h += `<div style="font-size:13px;color:#5d6b68;margin:2px 0 16px">${e(t("r.period", { p: d.period }))}</div>`;
+  for (const x of d.curs) {
+    if (d.anyTagged) {
+      h += `<div style="background:#0f766e;color:#ffffff;border-radius:12px;padding:14px 16px;margin:0 0 10px">`
+        + `<div style="font-size:13px;opacity:.85">${e(t("pdf.kids"))}${d.multiCur ? ` (${e(x.c)})` : ""}</div>`
+        + `<div style="font-size:28px;font-weight:700;line-height:1.2">${e(fmtMoney(x.kids, x.c))}</div></div>`;
+    }
+    h += `<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin:0 0 16px">`;
+    h += row(t("s.totalLabel", { n: x.count }), fmtMoney(x.total, x.c), !d.anyTagged);
+    if (d.anyTagged) {
+      h += row(t("pdf.not"), fmtMoney(x.not, x.c));
+      if (x.pending) h += row(t("s.untaggedLabel", { n: x.untaggedReceipts }), fmtMoney(x.review, x.c));
+    }
+    h += `</table>`;
+  }
+  if (d.months.length) {
+    const th = "padding:6px 8px;font-size:12px;color:#ffffff;background:#0f766e;";
+    h += `<div style="font-size:15px;font-weight:700;margin:0 0 6px">${e(t("r.byMonth"))}</div>`;
+    h += `<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin:0 0 16px;font-size:13px">`;
+    h += `<tr><th style="${th}text-align:left">${e(t("pdf.month"))}</th>`
+      + (d.anyTagged ? `<th style="${th}text-align:right">${e(t("pdf.kids"))}</th>` : "")
+      + `<th style="${th}text-align:right">${e(t("pdf.total"))}</th></tr>`;
+    d.months.forEach((m, i) => {
+      const bg = i % 2 ? "#f4f6f5" : "#ffffff";
+      const td = `padding:6px 8px;background:${bg};`;
+      h += `<tr><td style="${td}">${e(m.month)}${d.multiCur ? ` (${e(m.c)})` : ""}</td>`
+        + (d.anyTagged ? `<td style="${td}text-align:right;font-weight:700;color:#0f766e">${e(fmtMoney(m.kids, m.c))}</td>` : "")
+        + `<td style="${td}text-align:right">${e(fmtMoney(m.total, m.c))}</td></tr>`;
+    });
+    h += `</table>`;
+  }
+  if (d.types.length) {
+    const th = "padding:6px 8px;font-size:12px;color:#ffffff;background:#0f766e;";
+    h += `<div style="font-size:15px;font-weight:700;margin:0 0 6px">${e(t("s.byType"))}</div>`;
+    h += `<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin:0 0 16px;font-size:13px">`;
+    h += `<tr><th style="${th}text-align:left">${e(t("pdf.type"))}</th>`
+      + (d.hasOther ? `<th style="${th}text-align:right">${e(t("payer.me"))}</th><th style="${th}text-align:right">${e(t("payer.other"))}</th>` : "")
+      + `<th style="${th}text-align:right">${e(t("pdf.total"))}</th></tr>`;
+    d.types.forEach((x, i) => {
+      const td = `padding:6px 8px;background:${i % 2 ? "#f4f6f5" : "#ffffff"};`;
+      h += `<tr><td style="${td}">${e(x.type)}</td>`
+        + (d.hasOther ? `<td style="${td}text-align:right">${e(fmtMoney(x.me, x.c))}</td><td style="${td}text-align:right">${e(fmtMoney(x.other, x.c))}</td>` : "")
+        + `<td style="${td}text-align:right;font-weight:700;color:#0f766e">${e(fmtMoney(x.total, x.c))}</td></tr>`;
+    });
+    h += `</table>`;
+  }
+  if (d.checks.length) {
+    h += `<div style="border-left:4px solid #b54708;background:#fff6ed;padding:10px 12px;border-radius:6px;margin:0 0 16px">`
+      + `<div style="font-weight:700;color:#b54708;margin-bottom:4px">${e(t("s.checks"))}</div>`
+      + d.checks.map((x) => `<div style="font-size:13px">• ${e(x)}</div>`).join("") + `</div>`;
+  }
+  h += `<div style="font-size:12px;color:#5d6b68">${e(t("s.attached"))}</div></div>`;
+  return h;
+}
+
+async function copyRichSummary() {
+  const html = buildSummaryHtml();
+  const text = buildSummary({ attached: true });
+  try {
+    await navigator.clipboard.write([new ClipboardItem({
+      "text/html": new Blob([html], { type: "text/html" }),
+      "text/plain": new Blob([text], { type: "text/plain" }),
+    })]);
+    toast(t("t.richCopied"), 5000);
+  } catch {
+    toast((await copyText(text)) ? t("t.copied") : t("t.copyFail"));
+  }
+}
+
+/** Attachment names double as the email subject in Gmail, so make them readable. */
+function friendlyName(file, kind) {
+  const d = new Date().toISOString().slice(0, 10);
+  const ext = file.name.split(".").pop();
+  const title = t(reportReceipts().filter((r) => !r.voided).some(isTagged) ? "s.titleKids" : "s.title");
+  return new File([file], `${title} - ${t(kind)} ${d}.${ext}`, { type: file.type });
 }
 
 // jsPDF's built-in fonts only cover Windows-1252: map/replace anything else.
@@ -1249,6 +1457,20 @@ async function buildPdf(list = reportReceipts()) {
     });
   }
 
+  // Kids' share by expense type / who paid
+  const types = active.some((r) => r.payer === "other") || active.some((r) => r.items.some((it) => it.exp_type)) ? typeRows(active) : [];
+  if (types.length) {
+    const other = active.some((r) => r.payer === "other");
+    text(t("s.byType"), { size: 11, bold: true });
+    table({
+      head: [other ? [t("pdf.type"), t("payer.me"), t("payer.other"), t("pdf.total")] : [t("pdf.type"), t("pdf.total")]],
+      body: types.map((x) => other
+        ? [x.type, fmtMoney(x.me, x.c), fmtMoney(x.other, x.c), fmtMoney(x.total, x.c)]
+        : [x.type, fmtMoney(x.total, x.c)]),
+      columnStyles: other ? right([1, 2, 3]) : right([1]),
+    });
+  }
+
   // Checks + how to read
   const checks = checkLines(list);
   if (checks.length) {
@@ -1274,11 +1496,13 @@ async function buildPdf(list = reportReceipts()) {
       `${t("total")} ${fmtMoney(a.total, c)}`,
       tagged && `${t("pdf.kids")} ${fmtMoney(a.kids, c)}`,
       r.payment_method,
+      r.payer === "other" && t("badge.payerOther"),
       r.reviewed ? t("badge.verified") : t("badge.unverified"),
     ].filter(Boolean);
     text(meta.join("   ·   "), { size: 9, color: MUTED, gap: 2 });
     const flags = [
       r.document_type === "invoice" && t("badge.invoice"),
+      r.declared && `${t("badge.declared")}${r.source_ref ? ` (${r.source_ref})` : ""}`,
       dupes.has(r.id) && t("badge.dupe", { ids: dupes.get(r.id).join(", ") }),
     ].filter(Boolean);
     if (flags.length) text(flags.join("   ·   "), { size: 9, color: WARN, gap: 2 });
@@ -1293,10 +1517,10 @@ async function buildPdf(list = reportReceipts()) {
     if (tagged) {
       table({
         head: [[t("pdf.tag"), t("pdf.item"), t("pdf.qty"), t("pdf.amount"), t("pdf.kidsPart")]],
-        body: a.items.map((it) => [tagText(it), it.description, qty(it), fmtNum(it.line_total), fmtNum(itemKidsAmount(it, a.factor))]),
+        body: a.items.map((it) => [tagText(it) + (isKidsLine(it) && !it.linked && it.exp_type ? `\n${it.exp_type}` : ""), it.description, qty(it), fmtNum(it.line_total), fmtNum(itemKidsAmount(it, a.factor))]),
         foot: foot.map(([k, v], i) => ["", k, "", v, i === foot.length - 1 ? fmtMoney(a.kids, c) : ""]),
         showFoot: "lastPage",
-        columnStyles: { 0: { cellWidth: 72 }, 2: { cellWidth: 32, halign: "right" }, 3: { cellWidth: 62, halign: "right" }, 4: { cellWidth: 72, halign: "right" } },
+        columnStyles: { 0: { cellWidth: 92 }, 2: { cellWidth: 32, halign: "right" }, 3: { cellWidth: 62, halign: "right" }, 4: { cellWidth: 72, halign: "right" } },
       });
     } else {
       table({
@@ -1378,7 +1602,7 @@ async function shareReport() {
   const subject = $("#emailSubject").value.trim() || defaultSubject();
   const ok = await shareFiles("report", async () => {
     const list = reportReceipts();
-    return [await buildPdf(list), await xlsxFile(list)];
+    return [friendlyName(await buildPdf(list), "share.report"), friendlyName(await xlsxFile(list), "share.data")];
   }, { title: subject, text: buildSummary({ attached: true }) });
   if (ok) {
     await log("shared", "", t("lg.shared", { p: periodLabel(), n: reportReceipts().length }));
@@ -1449,7 +1673,7 @@ function render() {
   const open = files.filter((f) => f.status !== "done");
   $("#queue").replaceChildren(...open.map((f) => h("li", {},
     thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" })
-      : h("div", { class: "thumb", "aria-hidden": "true" }, f.kind === "pdf" ? "📄" : "🧾"),
+      : h("div", { class: "thumb", "aria-hidden": "true" }, f.kind === "pdf" ? "📄" : f.kind === "sheet" ? "📊" : "🧾"),
     h("div", {},
       h("div", { class: "qname" }, f.name),
       h("div", { class: `qstatus ${f.status}` }, f.status === "error" ? f.error : STATUS_LABEL[f.status])),
@@ -1534,6 +1758,16 @@ function render() {
   $("#emailPreview").textContent = buildSummary({ attached: true });
 }
 
+function typeSelect(r, idx, it) {
+  const names = settings.expTypes.map((x) => x.name);
+  if (it.exp_type && !names.includes(it.exp_type)) names.push(it.exp_type); // renamed/removed type stays visible
+  return h("select", {
+    class: `type-select ${it.exp_type ? "" : "empty"}`, disabled: r.voided, "aria-label": t("type.aria"),
+    onchange: (e) => setType(r, idx, e.target.value),
+  }, h("option", { value: "" }, t("type.none")),
+  names.map((n) => h("option", { value: n, selected: n === it.exp_type }, n)));
+}
+
 function renderReceipt(r, dupes) {
   const c = curOf(r);
   const a = allocation(r);
@@ -1548,10 +1782,12 @@ function renderReceipt(r, dupes) {
   const tagged = isTagged(r);
   if (tagged && a.pending) badges.push(h("span", { class: "badge warn" }, t("badge.untagged", { n: a.pending })));
   if (dupes.has(r.id)) badges.push(h("span", { class: "badge bad" }, t("badge.dupe", { ids: dupes.get(r.id).join(", ") })));
+  if (r.payer === "other") badges.push(h("span", { class: "badge other" }, t("badge.payerOther")));
+  if (r.declared) badges.push(h("span", { class: "badge warn" }, t("badge.declared")));
   if (r.document_type === "invoice") badges.push(h("span", { class: "badge warn" }, t("badge.invoice")));
   if (mismatch) badges.push(h("span", { class: "badge warn" }, t("badge.mismatch", { a: fmtNum(expected), b: fmtNum(r.total) })));
 
-  const rows = a.items.map((it, idx) => h("tr", { class: it.alloc === "not" ? "not-kids" : "" },
+  const rows = a.items.map((it, idx) => [h("tr", { class: `${it.alloc === "not" ? "not-kids" : ""} ${isKidsLine(it) && !it.linked ? "has-type" : ""}` },
     h("td", { class: "tagcell" },
       it.linked ? h("span", { class: "tag linked", title: t("tag.linked") }, "↳") : h("button", {
         class: `tag ${it.alloc}`, disabled: r.voided,
@@ -1566,10 +1802,11 @@ function renderReceipt(r, dupes) {
     h("td", { class: "desc" }, it.description,
       it.quantity != null && it.quantity !== 1 ? h("div", { class: "meta" }, `${fmtQty(it.quantity)} × ${fmtNum(it.unit_price)}`) : null,
       !it.linked && it.alloc === "review" && (it.ai_suggestion === "yes" || it.ai_suggestion === "no")
-        ? h("div", { class: "suggest" }, t(it.ai_suggestion === "yes" ? "suggest.yes" : "suggest.no")) : null),
+        ? h("div", { class: "suggest" }, t(it.ai_suggestion === "yes" ? "suggest.yes" : "suggest.no")
+          + (it.ai_suggestion === "yes" && validType(it.ai_type) ? ` · ${it.ai_type}` : "")) : null),
     h("td", { class: "num" },
       h("button", { class: "amount-btn", disabled: r.voided, title: t("amount.title"), onclick: () => editAmount(r, idx) }, fmtNum(it.line_total))),
-  ));
+  ), isKidsLine(it) && !it.linked && h("tr", { class: "type-row" }, h("td", {}), h("td", { colspan: 2 }, typeSelect(r, idx, it)))]);
 
   const foot = [
     r.subtotal != null && [t("subtotal"), r.subtotal],
@@ -1584,7 +1821,7 @@ function renderReceipt(r, dupes) {
         h("span", { class: "rid" }, r.id),
         h("h3", {}, r.store_name || t("unknownStore")),
         h("div", { class: "meta" }, [r.date ? t("receiptDate", { d: r.date }) : t("noDate"), r.time, r.payment_method].filter(Boolean).join(" · ")),
-        h("div", { class: "meta" }, `${r.source} · ${t("added", { ts: fmtTs(r.addedAt) })} · #${r.sha256.slice(0, 8)}`))),
+        h("div", { class: "meta" }, `${r.source}${r.source_ref ? ` (${r.source_ref})` : ""} · ${t("added", { ts: fmtTs(r.addedAt) })} · #${r.sha256.slice(0, 8)}`))),
     h("div", { class: "badges" }, badges),
     tagged
       ? h("div", { class: "kids-line" }, t("forKids"), h("b", {}, fmtMoney(a.kids, c)), t("ofTotal", { t: fmtMoney(a.total, c) }))
@@ -1610,6 +1847,7 @@ function renderReceipt(r, dupes) {
       h("summary", {}, t("more")),
       h("div", { class: "actions" },
         h("button", { class: "btn small", onclick: () => saveOriginal(r) }, t("btn.saveOrig")),
+        !r.voided && h("button", { class: "btn small", onclick: () => togglePayer(r) }, t("btn.payer", { who: payerLabel(r) })),
         !r.voided && suggestableCount(r) > 0 && h("button", { class: "btn small", onclick: () => applySuggestions(r) }, t("btn.applyOne")),
         !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "kids") }, t("btn.allKids")),
         !r.voided && h("button", { class: "btn small", onclick: () => setAll(r, "not") }, t("btn.noneKids")),
@@ -1630,6 +1868,7 @@ function openSettings() {
   $("#kidsContext").value = settings.kidsContext;
   $("#splitDefault").value = store.get("splitDefault");
   $("#autoTag").checked = settings.autoTag;
+  $("#expTypes").value = store.get("expTypes") || t("types.default");
   $("#langSelect").value = store.get("lang") || "auto";
   $("#defaultCurrency").placeholder = regionCurrency();
   $("#settingsDialog").showModal();
@@ -1644,6 +1883,8 @@ $("#settingsDialog").addEventListener("close", () => {
   store.set("kidsContext", $("#kidsContext").value.trim());
   store.set("splitDefault", $("#splitDefault").value.trim());
   store.set("autoTag", $("#autoTag").checked ? "1" : "");
+  const typesText = $("#expTypes").value.trim();
+  store.set("expTypes", typesText === t("types.default") ? "" : typesText);
   if (!$("#emailTo").value) $("#emailTo").value = settings.defaultEmail;
   const newLang = $("#langSelect").value;
   if (newLang !== (store.get("lang") || "auto")) {
@@ -1674,7 +1915,16 @@ applyStatic();
 $("#settingsBtn").addEventListener("click", openSettings);
 document.querySelectorAll("[data-open-settings]").forEach((b) => b.addEventListener("click", openSettings));
 
-for (const id of ["#cameraInput", "#galleryInput", "#pdfInput"]) {
+function renderPayerToggle() {
+  document.querySelectorAll("[data-payer]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.payer === settings.intakePayer)));
+}
+document.querySelectorAll("[data-payer]").forEach((b) => b.addEventListener("click", () => {
+  store.set("intakePayer", b.dataset.payer);
+  renderPayerToggle();
+}));
+renderPayerToggle();
+
+for (const id of ["#cameraInput", "#galleryInput", "#pdfInput", "#sheetInput"]) {
   $(id).addEventListener("change", async (e) => {
     const list = [...e.target.files];
     e.target.value = "";
@@ -1723,6 +1973,7 @@ $("#csvBtn").addEventListener("click", async () => {
   const blob = await buildXlsx();
   download(new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
 });
+$("#richCopyBtn").addEventListener("click", copyRichSummary);
 $("#copyBtn").addEventListener("click", async () => {
   toast((await copyText(buildSummary({ attached: false }))) ? t("t.copied") : t("t.copyFail"));
 });

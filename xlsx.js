@@ -1,6 +1,6 @@
 // Minimal .xlsx writer: real Excel files (no CSV separator/decimal problems), bold frozen header,
 // numbers stored as numbers. Built on the ZIP writer.
-import { makeZip } from "./zip.js";
+import { makeZip, readZip } from "./zip.js";
 
 const esc = (s) => String(s)
   // Strip characters XML 1.0 doesn't allow.
@@ -71,4 +71,113 @@ export async function makeXlsx(sheets) {
   ];
   const zip = await makeZip(files);
   return new Blob([zip], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+
+// ---------------------------------------------------------------------------
+// Reading spreadsheets (to import a grid of expenses someone else kept)
+// ---------------------------------------------------------------------------
+const REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const all = (node, tag) => (node ? [...node.getElementsByTagNameNS("*", tag)] : []);
+const textOf = (node) => all(node, "t").map((x) => x.textContent).join("");
+
+function colIndex(ref) {
+  let n = 0;
+  for (const ch of ref.replace(/\d+/g, "")) n = n * 26 + (ch.charCodeAt(0) - 64);
+  return n - 1;
+}
+
+function isDateFormat(id, custom) {
+  if ((id >= 14 && id <= 22) || (id >= 45 && id <= 47)) return true;
+  const code = custom.get(id);
+  if (!code) return false;
+  const bare = code.replace(/"[^"]*"|\[[^\]]*\]|\\./g, "");
+  return /[dy]/i.test(bare) || /m{3,}/i.test(bare);
+}
+
+const serialToIso = (v) => new Date(Date.UTC(1899, 11, 30) + Math.round(v * 86400000)).toISOString().slice(0, 10);
+
+/** Returns [{name, rows: any[][]}] for every sheet of an .xlsx file. Dates come back as YYYY-MM-DD. */
+export async function readXlsx(blob) {
+  const zip = await readZip(blob);
+  const xml = async (name) => {
+    const s = await zip.text(name);
+    return s ? new DOMParser().parseFromString(s, "application/xml") : null;
+  };
+  const wb = await xml("xl/workbook.xml");
+  if (!wb) throw new Error("Not an Excel workbook.");
+  const rels = await xml("xl/_rels/workbook.xml.rels");
+  const target = new Map(all(rels, "Relationship").map((r) => [r.getAttribute("Id"), r.getAttribute("Target")]));
+  const shared = all(await xml("xl/sharedStrings.xml"), "si").map(textOf);
+  const styles = await xml("xl/styles.xml");
+  const custom = new Map(all(styles, "numFmt").map((n) => [Number(n.getAttribute("numFmtId")), n.getAttribute("formatCode")]));
+  const xfs = all(all(styles, "cellXfs")[0], "xf").map((x) => Number(x.getAttribute("numFmtId") || 0));
+
+  const out = [];
+  for (const sh of all(wb, "sheet")) {
+    let path = target.get(sh.getAttributeNS(REL_NS, "id") || sh.getAttribute("r:id")) || "";
+    path = path.startsWith("/") ? path.slice(1) : `xl/${path}`;
+    const doc = await xml(path);
+    if (!doc) continue;
+    const rows = [];
+    for (const row of all(doc, "row")) {
+      const r = Number(row.getAttribute("r")) - 1;
+      const cells = [];
+      for (const c of all(row, "c")) {
+        const i = colIndex(c.getAttribute("r") || "A");
+        const tp = c.getAttribute("t");
+        const v = all(c, "v")[0]?.textContent;
+        let val = null;
+        if (tp === "s") val = shared[Number(v)] ?? "";
+        else if (tp === "inlineStr") val = textOf(all(c, "is")[0]);
+        else if (tp === "str" || tp === "e") val = v ?? "";
+        else if (tp === "b") val = v === "1" ? "TRUE" : "FALSE";
+        else if (v != null) {
+          const n = Number(v);
+          val = isDateFormat(xfs[Number(c.getAttribute("s") || 0)] ?? 0, custom) ? serialToIso(n) : n;
+        }
+        cells[i] = val;
+      }
+      rows[r >= 0 ? r : rows.length] = cells;
+    }
+    out.push({ name: sh.getAttribute("name") || "Sheet", rows: rows.map((r) => r || []) });
+  }
+  return out;
+}
+
+/** CSV with automatic separator detection (comma, semicolon or tab). */
+export function readCsv(text) {
+  const firstLine = text.split(/\r?\n/, 1)[0];
+  const sep = [";", "\t", ","].map((s) => [s, firstLine.split(s).length]).sort((a, b) => b[1] - a[1])[0][0];
+  const rows = [];
+  let row = [], cell = "", quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quoted) {
+      if (ch === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (ch === '"') quoted = false;
+      else cell += ch;
+    } else if (ch === '"') quoted = true;
+    else if (ch === sep) { row.push(cell); cell = ""; }
+    else if (ch === "\n" || ch === "\r") {
+      if (ch === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell); rows.push(row); row = []; cell = "";
+    } else cell += ch;
+  }
+  if (cell || row.length) { row.push(cell); rows.push(row); }
+  return [{ name: "CSV", rows }];
+}
+
+/** Turns sheets into compact text for Claude: one line per row, with sheet name and row number. */
+export function sheetsToText(sheets, maxRows = 1500) {
+  const lines = [];
+  for (const s of sheets) {
+    const rows = s.rows.map((r, i) => [i + 1, r]).filter(([, r]) => r.some((v) => v != null && String(v).trim() !== ""));
+    if (!rows.length) continue;
+    lines.push(`### Sheet: ${s.name}`);
+    for (const [n, r] of rows.slice(0, maxRows)) {
+      lines.push(`L${n}: ${Array.from(r, (v) => (v == null ? "" : String(v).replace(/\s+/g, " ").trim())).join(" | ")}`);
+    }
+    if (rows.length > maxRows) lines.push(`… ${rows.length - maxRows} more rows not shown`);
+  }
+  return lines.join("\n");
 }
