@@ -691,6 +691,25 @@ function totalMismatch(r) {
 }
 
 /**
+ * The adult part of an entry: lines you tagged "Not kids", or untagged lines Claude judged clearly for an
+ * adult (alcohol, adult clothing, tobacco…). Discount lines follow the line above. Includes the tax share.
+ */
+function adultPart(r) {
+  const a = allocation(r);
+  let amount = 0, prevAdult = false;
+  const names = [];
+  for (const it of a.items) {
+    const adult = it.alloc === "not" || (it.alloc === "review" && (it.linked ? prevAdult : it.ai_suggestion === "no"));
+    if (!it.linked) prevAdult = adult;
+    if (!adult) continue;
+    amount += (it.line_total || 0) * (a.factor || 1);
+    if (!it.linked && (it.line_total || 0) > 0) names.push(it.description);
+  }
+  const list = names.slice(0, 3).join(", ") + (names.length > 3 ? ` (+${names.length - 3})` : "");
+  return { amount: round2(Math.max(0, amount)), items: list };
+}
+
+/**
  * For each active receipt paid by the other parent: what backs it up and what looks wrong.
  * Declared grid rows are matched to the photos/PDFs the other parent supplied (same amount within a week,
  * or same store/description with a different amount). Nothing here changes the receipts: it only reports.
@@ -739,6 +758,11 @@ function verifyOther() {
     const c = curOf(d);
     const amount = receiptTotal(d);
     const p = v.match && getReceipt(v.match);
+    const own = adultPart(d);
+    if (own.amount > 0) {
+      add(d, "bad", "adultDeclared", { a: fmtMoney(own.amount, c), items: own.items });
+      v.adult = own.amount;
+    }
     if (!p) add(d, "warn", "noProof");
     else {
       const pt = receiptTotal(p);
@@ -746,7 +770,13 @@ function verifyOther() {
       if (!sameMoney(amount, pt) && !(kids != null && sameMoney(amount, kids))) {
         add(d, amount > pt ? "bad" : "warn", "amountDiff", { a: fmtMoney(amount, c), b: fmtMoney(pt, c), id: p.id, d: fmtMoney(amount - pt, c) });
       } else if (kids != null && amount > kids + 0.01) {
-        add(d, "warn", "inclNotKids", { k: fmtMoney(kids, c), id: p.id });
+        add(d, "bad", "inclNotKids", { k: fmtMoney(kids, c), id: p.id });
+        v.adult = round2(amount - kids);
+      }
+      const pa = kids == null ? adultPart(p) : null;
+      if (pa?.amount > 0 && amount > pt - pa.amount + 0.01) {
+        add(d, "bad", "inclAdult", { a: fmtMoney(pa.amount, c), items: pa.items, id: p.id });
+        v.adult = Math.max(v.adult || 0, round2(Math.min(amount, pa.amount)));
       }
       if (d.date && p.date && daysApart(d.date, p.date) > 7) add(d, "warn", "dateDiff", { a: d.date, b: p.date, id: p.id });
     }
@@ -771,6 +801,8 @@ function verifyOther() {
     if (mm) add(p, "bad", "math", { a: fmtNum(mm.expected), b: fmtNum(mm.printed) });
     if (p.authenticity_concerns) add(p, "bad", "claude", { n: p.authenticity_concerns });
     if (p.document_type === "invoice" && !p.paymentProof) add(p, "warn", "notPaid");
+    const pa = adultPart(p);
+    if (pa.amount > 0) add(p, "warn", "adultItems", { a: fmtMoney(pa.amount, c), items: pa.items });
     if (p.date && p.date > today()) add(p, "bad", "future", { d: p.date });
     if (!p.date) add(p, "warn", "noDate");
     const ex = f?.img?.exif;
@@ -822,7 +854,7 @@ function verifySummary(list, ver = verifyOther()) {
     if (!v || r.voided) continue;
     const c = curOf(r);
     const x = by[c] ??= { c, declared: 0, nDeclared: 0, backed: 0, nBacked: 0, noProof: 0, nNoProof: 0, diff: 0, nDiff: 0,
-      disputed: 0, nDisputed: 0, nProofs: 0, nFlagged: 0, nToCheck: 0 };
+      disputed: 0, nDisputed: 0, adult: 0, nAdult: 0, nProofs: 0, nFlagged: 0, nToCheck: 0 };
     const amt = receiptTotal(r);
     if (r.check?.decision === "disputed") { x.disputed += amt; x.nDisputed += 1; }
     if (needsCheck(r, v)) x.nToCheck += 1;
@@ -832,6 +864,7 @@ function verifySummary(list, ver = verifyOther()) {
       continue;
     }
     x.declared += amt; x.nDeclared += 1;
+    if (v.adult > 0) { x.adult += v.adult; x.nAdult += 1; }
     const p = v.match && getReceipt(v.match);
     if (!p) { x.noProof += amt; x.nNoProof += 1; continue; }
     const diff = v.issues.find((i) => i.key === "amountDiff");
@@ -1407,6 +1440,7 @@ function verifyLines(x) {
     x.nDeclared && t("vf.lBacked", { n: x.nBacked, a: m(x.backed) }),
     x.nDiff && t("vf.lDiff", { n: x.nDiff, a: m(x.diff) }),
     x.nNoProof && t("vf.lNoProof", { n: x.nNoProof, a: m(x.noProof) }),
+    x.nAdult && t("vf.lAdult", { n: x.nAdult, a: m(x.adult) }),
     x.nFlagged && t("vf.lFlagged", { n: x.nFlagged, p: x.nProofs }),
     x.nDisputed && t("vf.lDisputed", { n: x.nDisputed, a: m(x.disputed) }),
   ].filter(Boolean);
@@ -1765,6 +1799,7 @@ function checkLines(list) {
     if (x.nNoProof) out.push(t("vf.lNoProof", { n: x.nNoProof, a: fmtMoney(x.noProof, x.c) }));
     if (x.nDiff) out.push(t("vf.lDiff", { n: x.nDiff, a: fmtMoney(x.diff, x.c) }));
     if (x.nFlagged) out.push(t("vf.lFlagged", { n: x.nFlagged, p: x.nProofs }));
+    if (x.nAdult) out.push(t("vf.lAdult", { n: x.nAdult, a: fmtMoney(x.adult, x.c) }));
     if (x.nDisputed) out.push(t("vf.lDisputed", { n: x.nDisputed, a: fmtMoney(x.disputed, x.c) }));
   }
   const voided = list.length - active.length;
@@ -2463,6 +2498,7 @@ function renderOtherCheck(ver) {
         line("ok", t("vf.sBacked"), x.nBacked, x.backed, x.c),
         x.nDiff ? line("bad", t("vf.sDiff"), x.nDiff, x.diff, x.c) : null,
         x.nNoProof ? line("warn", t("vf.sNoProof"), x.nNoProof, x.noProof, x.c) : null,
+        x.nAdult ? line("bad", t("vf.sAdult"), x.nAdult, x.adult, x.c) : null,
       ] : null,
       x.nProofs ? line(x.nFlagged ? "bad" : "ok", t("vf.sProofs", { n: x.nFlagged }), x.nProofs, null, x.c) : null,
       x.nDisputed ? line("bad", t("vf.sDisputed"), x.nDisputed, x.disputed, x.c) : null)),
