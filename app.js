@@ -1225,10 +1225,10 @@ async function buildPack({ full = false } = {}) {
   const ids = new Set(list.map((r) => r.fileId));
   for (const r of list) if (r.paymentProof) ids.add(r.paymentProof.fileId);
   const used = files.filter((f) => f.blob && (full ? f.status === "done" || ids.has(f.id) : ids.has(f.id)));
-  // Bank/card statements hold every other transaction too: an evidence pack lists them (with their
-  // fingerprint) but leaves the files out. A full backup keeps them so they can be restored.
-  const pf = full ? used : used.filter((f) => f.role !== "statement");
-  const withheld = full ? [] : used.filter((f) => f.role === "statement");
+  // An evidence pack lists every original file with its fingerprint but leaves the files themselves
+  // out (they stay on the phone, available on request). A full backup keeps them so it can be restored.
+  const pf = full ? used : [];
+  const withheld = full ? [] : used;
 
   const stamped = [];
   for (const f of pf) {
@@ -1249,10 +1249,12 @@ async function buildPack({ full = false } = {}) {
     period: label,
     seq,
     receipts: list,
-    files: pf.map(({ blob, ...meta }) => ({ ...meta, packPath: originalPath(meta) })),
+    files: full
+      ? pf.map(({ blob, ...meta }) => ({ ...meta, packPath: originalPath(meta) }))
+      : withheld.map(({ blob, ...meta }) => ({ ...meta, withheld: true })),
     log: logEntries.map(({ seq: _s, ...e }) => e),
   }, null, 2);
-  const readme = [full ? t("pk.readmeFull") : t("pk.readme", { p: label }), "", ...t("pk.lines")].join("\n");
+  const readme = [full ? t("pk.readmeFull") : t("pk.readme", { p: label }), "", ...t(full ? "pk.linesFull" : "pk.lines")].join("\n");
 
   // The report covers the period, or everything for a full backup.
   const savedFrom = $("#periodFrom").value;
@@ -1299,6 +1301,7 @@ async function restorePack(zipFile) {
   let addedFiles = 0, addedReceipts = 0, badHash = 0, missing = 0;
   for (const meta of data.files) {
     if (files.some((f) => f.id === meta.id || f.sha256 === meta.sha256)) continue;
+    if (meta.withheld) continue; // evidence pack: listed with its fingerprint only
     const path = prefix + (meta.packPath || originalPath(meta));
     const blob = await zip.blob(path, meta.type);
     if (!blob) { missing += 1; continue; }
