@@ -1121,40 +1121,129 @@ function checkLines(list) {
   return out;
 }
 
-/** The email body: a few lines a person can read on a phone. Details go in the attachments. */
-function buildSummary({ attached = true } = {}) {
+/** Figures shared by the plain-text and the coloured summary. */
+function summaryData() {
   const list = reportReceipts();
   const active = list.filter((r) => !r.voided);
   const totals = totalsFor(active);
   const anyTagged = active.some(isTagged);
-  const multiCur = Object.keys(totals).length > 1;
-  const L = [t(anyTagged ? "s.titleKids" : "s.title"), t("r.period", { p: periodLabel() }), ""];
-  for (const [c, tot] of Object.entries(totals)) {
-    if (multiCur) L.push(`— ${c} —`);
-    if (anyTagged) L.push(t("s.kids", { t: fmtMoney(tot.kids, c) }));
-    L.push(t("s.total", { t: fmtMoney(tot.total, c), n: tot.count }));
-    if (anyTagged) {
-      L.push(t("s.not", { t: fmtMoney(tot.not, c) }));
-      const untaggedReceipts = active.filter((r) => curOf(r) === c && allocation(r).pending).length;
-      if (tot.pending) L.push(t("s.untagged", { t: fmtMoney(tot.review, c), n: untaggedReceipts }));
+  const curs = Object.entries(totals).map(([c, tot]) => ({
+    c, ...tot,
+    untaggedReceipts: active.filter((r) => curOf(r) === c && allocation(r).pending).length,
+  }));
+  return {
+    title: t(anyTagged ? "s.titleKids" : "s.title"),
+    period: periodLabel(),
+    anyTagged,
+    multiCur: curs.length > 1,
+    curs,
+    months: monthRows(active),
+    checks: checkLines(list),
+  };
+}
+
+/**
+ * The email body as plain text. Gmail on iPhone drops line breaks from shared text, so every line
+ * ends with a period or starts with a bullet: it reads correctly whether the breaks survive or not.
+ */
+function buildSummary({ attached = true } = {}) {
+  const d = summaryData();
+  const L = [`${d.title} — ${d.period}.`, ""];
+  for (const x of d.curs) {
+    const cur = d.multiCur ? ` (${x.c})` : "";
+    if (d.anyTagged) L.push(`${t("s.kids", { t: fmtMoney(x.kids, x.c) })}${cur}.`);
+    L.push(`${t("s.total", { t: fmtMoney(x.total, x.c), n: x.count })}${cur}.`);
+    if (d.anyTagged) {
+      L.push(`${t("s.not", { t: fmtMoney(x.not, x.c) })}.`);
+      if (x.pending) L.push(`${t("s.untagged", { t: fmtMoney(x.review, x.c), n: x.untaggedReceipts })}.`);
     }
     L.push("");
   }
-  const months = monthRows(active);
-  if (months.length) {
-    L.push(t(anyTagged ? "s.byMonthKids" : "s.byMonth"));
-    for (const m of months) {
-      const cur = multiCur ? ` (${m.c})` : "";
-      L.push(anyTagged
-        ? `  ${m.month} : ${fmtMoney(m.kids, m.c)} / ${fmtMoney(m.total, m.c)}${cur}`
-        : `  ${m.month} : ${fmtMoney(m.total, m.c)}${cur}`);
+  if (d.months.length) {
+    L.push(t(d.anyTagged ? "s.byMonthKids" : "s.byMonth"));
+    for (const m of d.months) {
+      const cur = d.multiCur ? ` (${m.c})` : "";
+      L.push(d.anyTagged
+        ? `• ${m.month} : ${fmtMoney(m.kids, m.c)} / ${fmtMoney(m.total, m.c)}${cur};`
+        : `• ${m.month} : ${fmtMoney(m.total, m.c)}${cur};`);
     }
     L.push("");
   }
-  const checks = checkLines(list);
-  if (checks.length) L.push(t("s.checks"), ...checks.map((x) => `  • ${x}`), "");
+  if (d.checks.length) L.push(t("s.checks"), ...d.checks.map((x) => `• ${x};`), "");
   if (attached) L.push(t("s.attached"));
   return L.join("\n").trim();
+}
+
+/** The same summary with colours, for pasting into an email (inline styles: mail apps drop <style>). */
+function buildSummaryHtml() {
+  const d = summaryData();
+  const e = (v) => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const FONT = "font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;";
+  const row = (label, value, strong = false) =>
+    `<tr><td style="padding:6px 0;color:#5d6b68;font-size:14px;border-bottom:1px solid #e5ebe9">${e(label)}</td>`
+    + `<td style="padding:6px 0;text-align:right;font-size:14px;border-bottom:1px solid #e5ebe9;${strong ? "font-weight:700;" : ""}">${e(value)}</td></tr>`;
+  let h = `<div style="${FONT}color:#17201e;max-width:560px">`;
+  h += `<div style="font-size:22px;font-weight:700;margin:0">${e(d.title)}</div>`;
+  h += `<div style="font-size:13px;color:#5d6b68;margin:2px 0 16px">${e(t("r.period", { p: d.period }))}</div>`;
+  for (const x of d.curs) {
+    if (d.anyTagged) {
+      h += `<div style="background:#0f766e;color:#ffffff;border-radius:12px;padding:14px 16px;margin:0 0 10px">`
+        + `<div style="font-size:13px;opacity:.85">${e(t("pdf.kids"))}${d.multiCur ? ` (${e(x.c)})` : ""}</div>`
+        + `<div style="font-size:28px;font-weight:700;line-height:1.2">${e(fmtMoney(x.kids, x.c))}</div></div>`;
+    }
+    h += `<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin:0 0 16px">`;
+    h += row(t("s.totalLabel", { n: x.count }), fmtMoney(x.total, x.c), !d.anyTagged);
+    if (d.anyTagged) {
+      h += row(t("pdf.not"), fmtMoney(x.not, x.c));
+      if (x.pending) h += row(t("s.untaggedLabel", { n: x.untaggedReceipts }), fmtMoney(x.review, x.c));
+    }
+    h += `</table>`;
+  }
+  if (d.months.length) {
+    const th = "padding:6px 8px;font-size:12px;color:#ffffff;background:#0f766e;";
+    h += `<div style="font-size:15px;font-weight:700;margin:0 0 6px">${e(t("r.byMonth"))}</div>`;
+    h += `<table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;margin:0 0 16px;font-size:13px">`;
+    h += `<tr><th style="${th}text-align:left">${e(t("pdf.month"))}</th>`
+      + (d.anyTagged ? `<th style="${th}text-align:right">${e(t("pdf.kids"))}</th>` : "")
+      + `<th style="${th}text-align:right">${e(t("pdf.total"))}</th></tr>`;
+    d.months.forEach((m, i) => {
+      const bg = i % 2 ? "#f4f6f5" : "#ffffff";
+      const td = `padding:6px 8px;background:${bg};`;
+      h += `<tr><td style="${td}">${e(m.month)}${d.multiCur ? ` (${e(m.c)})` : ""}</td>`
+        + (d.anyTagged ? `<td style="${td}text-align:right;font-weight:700;color:#0f766e">${e(fmtMoney(m.kids, m.c))}</td>` : "")
+        + `<td style="${td}text-align:right">${e(fmtMoney(m.total, m.c))}</td></tr>`;
+    });
+    h += `</table>`;
+  }
+  if (d.checks.length) {
+    h += `<div style="border-left:4px solid #b54708;background:#fff6ed;padding:10px 12px;border-radius:6px;margin:0 0 16px">`
+      + `<div style="font-weight:700;color:#b54708;margin-bottom:4px">${e(t("s.checks"))}</div>`
+      + d.checks.map((x) => `<div style="font-size:13px">• ${e(x)}</div>`).join("") + `</div>`;
+  }
+  h += `<div style="font-size:12px;color:#5d6b68">${e(t("s.attached"))}</div></div>`;
+  return h;
+}
+
+async function copyRichSummary() {
+  const html = buildSummaryHtml();
+  const text = buildSummary({ attached: true });
+  try {
+    await navigator.clipboard.write([new ClipboardItem({
+      "text/html": new Blob([html], { type: "text/html" }),
+      "text/plain": new Blob([text], { type: "text/plain" }),
+    })]);
+    toast(t("t.richCopied"), 5000);
+  } catch {
+    toast((await copyText(text)) ? t("t.copied") : t("t.copyFail"));
+  }
+}
+
+/** Attachment names double as the email subject in Gmail, so make them readable. */
+function friendlyName(file, kind) {
+  const d = new Date().toISOString().slice(0, 10);
+  const ext = file.name.split(".").pop();
+  const title = t(reportReceipts().filter((r) => !r.voided).some(isTagged) ? "s.titleKids" : "s.title");
+  return new File([file], `${title} - ${t(kind)} ${d}.${ext}`, { type: file.type });
 }
 
 // jsPDF's built-in fonts only cover Windows-1252: map/replace anything else.
@@ -1378,7 +1467,7 @@ async function shareReport() {
   const subject = $("#emailSubject").value.trim() || defaultSubject();
   const ok = await shareFiles("report", async () => {
     const list = reportReceipts();
-    return [await buildPdf(list), await xlsxFile(list)];
+    return [friendlyName(await buildPdf(list), "share.report"), friendlyName(await xlsxFile(list), "share.data")];
   }, { title: subject, text: buildSummary({ attached: true }) });
   if (ok) {
     await log("shared", "", t("lg.shared", { p: periodLabel(), n: reportReceipts().length }));
@@ -1723,6 +1812,7 @@ $("#csvBtn").addEventListener("click", async () => {
   const blob = await buildXlsx();
   download(new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
 });
+$("#richCopyBtn").addEventListener("click", copyRichSummary);
 $("#copyBtn").addEventListener("click", async () => {
   toast((await copyText(buildSummary({ attached: false }))) ? t("t.copied") : t("t.copyFail"));
 });
