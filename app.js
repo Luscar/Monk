@@ -32,8 +32,6 @@ const settings = {
     }).filter((x) => x.name);
   },
   get intakePayer() { return store.get("intakePayer") === "other" ? "other" : "me"; },
-  /** New files are marked sensitive: kept on the device, never sent to Claude, entered by hand. */
-  get intakeSensitive() { return store.get("intakeSensitive") === "1"; },
   get kidsContext() { return store.get("kidsContext").trim(); },
   get splitDefault() {
     const raw = store.get("splitDefault").trim();
@@ -310,7 +308,7 @@ async function addFiles(fileList, { role = "receipt" } = {}) {
       receiptIds: [],
       payer: settings.intakePayer,
       role,
-      sensitive: settings.intakeSensitive,
+      sensitive: false, // the 🔒 button on the file in the queue marks it sensitive before extraction
     };
     if (rec.sensitive) rec.status = "manual";
     if (kind === "image" && role !== "statement") rec.img = await imageInfo(file);
@@ -2704,8 +2702,8 @@ document.querySelectorAll("[data-payer]").forEach((b) => b.addEventListener("cli
 }));
 renderPayerToggle();
 
-$("#sensitiveToggle").checked = settings.intakeSensitive;
-$("#sensitiveToggle").addEventListener("change", (e) => store.set("intakeSensitive", e.target.checked ? "1" : ""));
+// The old "sensitive documents" checkbox is gone: forget its saved state.
+try { localStorage.removeItem("intakeSensitive"); } catch { /* storage unavailable */ }
 
 $("#mAddLine").addEventListener("click", () => { const row = manualLine(); $("#mItems").append(row); row.querySelector(".desc").focus(); });
 $("#manualForm").addEventListener("submit", async (e) => {

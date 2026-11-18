@@ -55,7 +55,7 @@ Everything marked *Paid by: Other parent* (their Excel/CSV grid and the photos/P
 
 ## Sensitive documents (never sent to Claude)
 
-Tick **🔒 Sensitive documents** under "Add receipts" before adding files, or tap the 🔒 button on a file in the queue. A sensitive file:
+Tap the 🔒 button on a file in the queue before extracting (nothing is sent until you tap *Extract with Claude*). A sensitive file:
 
 - stays on the device with its fingerprint, like every other original, but is **never sent to Claude** ("Extract with Claude" skips it, and the code refuses to build a Claude request for it);
 - gets a **✍️ Enter by hand** button: store, date, currency, payment method, lines (description + amount), tax, total, note. *Save & add another* handles a file holding several receipts, and "More… → Add another entry from this file" works later too;

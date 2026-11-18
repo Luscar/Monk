@@ -247,7 +247,6 @@ tr.type-row .type-select { max-width: none; margin-top: 0; }
 .tx-picker .type-select { max-width: none; }
 
 /* --- Sensitive documents (never sent to Claude) --- */
-.sensitive-toggle { margin-top: 10px; }
 .qstatus.manual { color: var(--warn); }
 .qactions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
 .btn.small.lock[aria-pressed="true"] { background: var(--warn); border-color: var(--warn); color: #fff; }
