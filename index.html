@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Receipt Mailer</title>
+  <meta name="description" content="Snap or upload receipts, extract them with Claude, and email a summary.">
+  <meta name="theme-color" content="#0f766e">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Receipts">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Receipt Mailer</h1>
+    <button id="settingsBtn" class="icon-btn" aria-label="Settings" title="Settings">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3.3h-4l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z" transform="translate(-1 0)"/></svg>
+    </button>
+  </header>
+
+  <main>
+    <section id="setupNotice" class="card notice" hidden>
+      <strong>Add your Anthropic API key to get started.</strong>
+      <p>It is stored only on this device and sent only to api.anthropic.com.</p>
+      <button class="btn primary" data-open-settings>Open settings</button>
+    </section>
+
+    <section class="card">
+      <h2>1. Add receipts</h2>
+      <div class="add-grid">
+        <label class="btn big">
+          <input id="cameraInput" type="file" accept="image/*" capture="environment" hidden>
+          <span class="emoji" aria-hidden="true">📷</span> Camera
+        </label>
+        <label class="btn big">
+          <input id="galleryInput" type="file" accept="image/*" multiple hidden>
+          <span class="emoji" aria-hidden="true">🖼️</span> Gallery
+        </label>
+        <label class="btn big">
+          <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple hidden>
+          <span class="emoji" aria-hidden="true">📄</span> PDF
+        </label>
+      </div>
+      <p class="hint">Mix as many sources as you like. A single photo or PDF may contain several receipts.</p>
+      <div id="dropZone" class="drop-zone">…or drop files here</div>
+      <ul id="queue" class="queue"></ul>
+      <div class="row">
+        <button id="processBtn" class="btn primary" disabled>Extract with Claude</button>
+        <button id="clearBtn" class="btn ghost" disabled>Clear all</button>
+      </div>
+    </section>
+
+    <section class="card" id="resultsCard" hidden>
+      <h2>2. Review</h2>
+      <div id="totals" class="totals"></div>
+      <div id="receipts"></div>
+    </section>
+
+    <section class="card" id="sendCard" hidden>
+      <h2>3. Send</h2>
+      <label class="field">
+        <span>Email to</span>
+        <input id="emailTo" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
+      </label>
+      <label class="field">
+        <span>Subject</span>
+        <input id="emailSubject" type="text">
+      </label>
+      <div class="row wrap">
+        <button id="emailBtn" class="btn primary">Open in Mail</button>
+        <button id="shareBtn" class="btn">Share + CSV</button>
+        <button id="copyBtn" class="btn">Copy summary</button>
+        <button id="csvBtn" class="btn">Download CSV</button>
+      </div>
+      <details class="preview">
+        <summary>Preview email text</summary>
+        <pre id="emailPreview"></pre>
+      </details>
+    </section>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="settings">
+      <h2>Settings</h2>
+      <label class="field">
+        <span>Anthropic API key</span>
+        <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
+      </label>
+      <label class="field">
+        <span>Model</span>
+        <select id="model">
+          <option value="claude-opus-5-5">Claude Opus 5.5 (most accurate)</option>
+          <option value="claude-sonnet-5-5">Claude Sonnet 5.5 (balanced)</option>
+          <option value="claude-haiku-5-5">Claude Haiku 5.5 (cheapest)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Default recipient</span>
+        <input id="defaultEmail" type="email" inputmode="email" placeholder="you@example.com">
+      </label>
+      <label class="field">
+        <span>Your currency (used when a receipt doesn't show one)</span>
+        <input id="defaultCurrency" type="text" maxlength="3" placeholder="USD">
+      </label>
+      <p class="hint">Your key is saved in this browser's local storage only. Anyone with access to this device/browser profile could read it — use a key with a spend limit.</p>
+      <div class="row">
+        <button value="save" class="btn primary">Save</button>
+        <button value="cancel" class="btn ghost" formnovalidate>Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
