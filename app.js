@@ -38,6 +38,12 @@ const settings = {
     const n = Number(raw);
     return raw !== "" && Number.isFinite(n) && n >= 0 && n <= 100 ? n : 50;
   },
+  /** My share (%) of the children's expenses, for the account between the parents. */
+  get parentShare() {
+    const raw = store.get("parentShare").trim().replace(",", ".");
+    const n = Number(raw);
+    return raw !== "" && Number.isFinite(n) && n >= 0 && n <= 100 ? n : 50;
+  },
 };
 
 // Models that support server-side refusal fallbacks ("default" routing).
@@ -1606,6 +1612,66 @@ function buildXlsx(list = reportReceipts()) {
   ]);
 }
 
+/**
+ * Excel for the other parent: only what concerns them. One row per children's line (kids or split)
+ * of each non-voided receipt in the period, plus a summary with the account between the parents.
+ * Leaves out adult lines, untagged lines, fingerprints, Claude's suggestions, private notes and flags.
+ */
+function buildExXlsx(list = reportReceipts()) {
+  const ver = verifyOther();
+  const lines = [t("ex.linesHdr")];
+  const sums = {};
+  const myPct = settings.parentShare;
+  for (const r of list) {
+    if (r.voided) continue;
+    const a = allocation(r);
+    const kidsItems = a.items.filter(isKidsLine);
+    if (!kidsItems.length) continue;
+    const c = curOf(r);
+    const disputed = r.payer === "other" && r.check?.decision === "disputed";
+    const status = disputed ? t("vf.disputedShort", { r: r.check.reason || "" })
+      : r.payer === "other" && r.check?.decision === "accepted" ? t("vf.acceptedShort") : "";
+    for (const it of kidsItems) {
+      const amt = itemKidsAmount(it, a.factor);
+      lines.push([
+        r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description || ""}`, it.exp_type || "",
+        it.line_total, it.alloc === "split" ? (it.split_pct ?? 50) : 100, amt, c, status,
+      ]);
+      const s = (sums[c] ??= { me: 0, other: 0, disputed: 0 });
+      if (disputed) s.disputed += amt;
+      else s[r.payer === "other" ? "other" : "me"] += amt;
+    }
+  }
+  const summary = [t("ex.sumHdr"), [t("ex.period"), periodLabel()], [t("ex.myShare"), `${myPct} %`], [t("ex.otherShare"), `${100 - myPct} %`], []];
+  for (const [c, s] of Object.entries(sums).sort()) {
+    const total = round2(s.me + s.other);
+    const myDue = round2(total * myPct / 100);
+    const balance = round2(s.me - myDue); // > 0: the other parent owes me
+    summary.push(
+      [t("ex.currency"), c],
+      [t("ex.paidMe"), round2(s.me)],
+      [t("ex.paidOther"), round2(s.other)],
+      [t("ex.total"), total],
+      [t("ex.dueMe", { p: myPct }), myDue],
+      [t("ex.dueOther", { p: 100 - myPct }), round2(total - myDue)],
+      [balance >= 0 ? t("ex.otherOwes") : t("ex.iOwe"), Math.abs(balance)],
+    );
+    if (s.disputed) summary.push([t("ex.disputed"), round2(s.disputed)]);
+    summary.push([]);
+  }
+  if (!Object.keys(sums).length) summary.push([t("ex.none")]);
+  summary.push([t("ex.note")]);
+  return makeXlsx([
+    { name: t("ex.sheetSummary"), rows: summary, money: [1], widths: { 0: 44, 1: 28 } },
+    { name: t("ex.sheetLines"), rows: lines, money: [6, 8], widths: { 4: 40, 10: 30 } },
+  ]);
+}
+
+async function exXlsxFile(list) {
+  const blob = await buildExXlsx(list);
+  return new File([blob], `${t("ex.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type });
+}
+
 function buildLogCsv() {
   return toCsv([t("csv.log"), ...logEntries.map((e) => [e.ts, actionLabel(e.action), e.receiptId, e.detail])]);
 }
@@ -2645,6 +2711,7 @@ function openSettings() {
   $("#defaultCurrency").value = store.get("defaultCurrency");
   $("#kidsContext").value = settings.kidsContext;
   $("#splitDefault").value = store.get("splitDefault");
+  $("#parentShare").value = store.get("parentShare");
   $("#autoTag").checked = settings.autoTag;
   $("#expTypes").value = store.get("expTypes") || t("types.default");
   $("#langSelect").value = store.get("lang") || "auto";
@@ -2660,6 +2727,7 @@ $("#settingsDialog").addEventListener("close", () => {
   store.set("defaultCurrency", $("#defaultCurrency").value.trim().toUpperCase());
   store.set("kidsContext", $("#kidsContext").value.trim());
   store.set("splitDefault", $("#splitDefault").value.trim());
+  store.set("parentShare", $("#parentShare").value.trim());
   store.set("autoTag", $("#autoTag").checked ? "1" : "");
   const typesText = $("#expTypes").value.trim();
   store.set("expTypes", typesText === t("types.default") ? "" : typesText);
@@ -2767,6 +2835,14 @@ $("#zipBtn").addEventListener("click", async () => {
 $("#csvBtn").addEventListener("click", async () => {
   const blob = await buildXlsx();
   download(new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
+});
+$("#exXlsxBtn").addEventListener("click", async () => {
+  try {
+    const list = reportReceipts();
+    await shareOrDownload(await exXlsxFile(list), t("ex.shareTitle"));
+    await log("ex_exported", "", t("lg.exExport", { p: periodLabel(), pct: settings.parentShare }));
+    render();
+  } catch (err) { console.error(err); toast(t("t.packFail")); }
 });
 $("#richCopyBtn").addEventListener("click", copyRichSummary);
 $("#copyBtn").addEventListener("click", async () => {

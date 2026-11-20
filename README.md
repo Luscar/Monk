@@ -43,6 +43,15 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 - **Full backup & restore** (Settings): one .zip with everything. Restoring on a new phone re-checks every fingerprint, merges without duplicates, and carries on with the ID numbering. The app reminds you when the last backup is more than 7 days old.
 - **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json`, `originals/` and `stamped/`, named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
 
+## Excel for the other parent (account between parents)
+
+*Send → More options… → Excel for the other parent* builds an .xlsx limited to what concerns the other parent, for the chosen period:
+
+- **Children's lines** sheet: one row per line tagged *Kids* or *Split* (receipt ID, date, store, paid by, item, expense type, line amount, % for the children, children's amount with tax/discounts shared out, currency, and *Accepted/Disputed* for the other parent's expenses). Adult lines, untagged lines, voided receipts, fingerprints, Claude's suggestions, private notes and flags are left out.
+- **Account** sheet: per currency, children's expenses paid by me / by the other parent, the total, each parent's share and the balance (who owes whom). Each parent's share comes from Settings → *My share of the children's expenses* (50 % by default). Disputed expenses are shown separately and not counted.
+
+The export is recorded in the audit log.
+
 ## Checking the other parent's expenses
 
 Everything marked *Paid by: Other parent* (their Excel/CSV grid and the photos/PDFs they send) gets a **Check (other parent)** box, a summary at the top of "Your receipts", and the *Other parent: to check* filter.
