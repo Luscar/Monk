@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Receipt Mailer</title>
-  <meta name="description" content="Capture receipts, tag child expenses item by item, and send a traceable report.">
+  <title>Receipts</title>
+  <meta name="description" content="Collect receipts, let Claude pull out what matters, and split the kids' expenses between parents.">
   <meta name="theme-color" content="#0f766e">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
@@ -17,7 +17,7 @@
 </head>
 <body>
   <header class="topbar">
-    <h1 data-i18n="app.title">Receipt Mailer</h1>
+    <h1 data-i18n="app.title">Receipts</h1>
     <button id="settingsBtn" class="icon-btn" data-i18n-aria="settings" aria-label="Settings" title="Settings">
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M19.4 13a7.5 7.5 0 0 0 0-2l2.1-1.6-2-3.5-2.5 1a7.6 7.6 0 0 0-1.7-1L15 3.3h-4l-.4 2.6a7.6 7.6 0 0 0-1.7 1l-2.5-1-2 3.5L6.6 11a7.5 7.5 0 0 0 0 2l-2.1 1.6 2 3.5 2.5-1a7.6 7.6 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.6 7.6 0 0 0 1.7-1l2.5 1 2-3.5zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z" transform="translate(-1 0)"/></svg>
     </button>
@@ -25,222 +25,116 @@
 
   <main>
     <section id="setupNotice" class="card notice" hidden>
-      <strong data-i18n="setup.title">Add your Anthropic API key to get started.</strong>
-      <p data-i18n="setup.body">It is stored only on this device and sent only to api.anthropic.com.</p>
-      <button class="btn primary" data-open-settings data-i18n="setup.open">Open settings</button>
+      <strong data-i18n="setup.title"></strong>
+      <p data-i18n="setup.body"></p>
+      <button class="btn primary" data-open-settings data-i18n="setup.open"></button>
     </section>
 
     <section class="card">
-      <h2 data-i18n="add.title">1. Add receipts</h2>
+      <h2 data-i18n="add.title"></h2>
       <div class="add-grid">
         <label class="btn big">
           <input id="cameraInput" type="file" accept="image/*" capture="environment" hidden>
-          <span class="emoji" aria-hidden="true">📷</span> <span data-i18n="add.camera">Camera</span>
+          <span class="emoji" aria-hidden="true">📷</span> <span data-i18n="add.camera"></span>
         </label>
         <label class="btn big">
           <input id="galleryInput" type="file" accept="image/*" multiple hidden>
-          <span class="emoji" aria-hidden="true">🖼️</span> <span data-i18n="add.gallery">Gallery</span>
+          <span class="emoji" aria-hidden="true">🖼️</span> <span data-i18n="add.gallery"></span>
         </label>
         <label class="btn big">
           <input id="pdfInput" type="file" accept="application/pdf,.pdf" multiple hidden>
-          <span class="emoji" aria-hidden="true">📄</span> <span data-i18n="add.pdf">PDF</span>
+          <span class="emoji" aria-hidden="true">📄</span> <span data-i18n="add.pdf"></span>
         </label>
         <label class="btn big">
           <input id="sheetInput" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" multiple hidden>
-          <span class="emoji" aria-hidden="true">📊</span> <span data-i18n="add.sheet">Excel grid</span>
-        </label>
-        <label class="btn big">
-          <input id="statementInput" type="file" accept="image/*,application/pdf,.pdf,.csv,.xlsx,text/csv" multiple hidden>
-          <span class="emoji" aria-hidden="true">🏦</span> <span data-i18n="add.statement">Statement</span>
+          <span class="emoji" aria-hidden="true">📊</span> <span data-i18n="add.sheet"></span>
         </label>
       </div>
       <div class="payer-toggle" role="group">
-        <span data-i18n="payer.label">Paid by:</span>
-        <button type="button" data-payer="me" data-i18n="payer.me">Me</button>
-        <button type="button" data-payer="other" data-i18n="payer.other">Other parent</button>
+        <span data-i18n="payer.label"></span>
+        <button type="button" data-payer="me" data-i18n="payer.me"></button>
+        <button type="button" data-payer="other" data-i18n="payer.other"></button>
       </div>
-      <p class="hint" data-i18n="add.payerHint"></p>
-      <p class="hint" data-i18n-html="sens.toggle"></p>
-      <p class="hint" data-i18n="add.hint"></p>
-      <div id="dropZone" class="drop-zone" data-i18n="add.drop">…or drop files here</div>
+      <div id="dropZone" class="drop-zone" data-i18n="add.drop"></div>
       <ul id="queue" class="queue"></ul>
-      <p id="processedCount" class="hint"></p>
       <div class="row">
-        <button id="processBtn" class="btn primary" disabled data-i18n="process.idle">Extract with Claude</button>
+        <button id="processBtn" class="btn primary" disabled data-i18n="process.idle"></button>
       </div>
     </section>
 
-    <section class="card" id="resultsCard" hidden>
-      <h2 data-i18n="results.title">2. Your receipts</h2>
-      <p class="hint" data-i18n-html="results.hint"></p>
-      <div id="totals" class="totals"></div>
-      <button id="applyAllBtn" class="btn small" hidden></button>
-      <div id="otherCheck" class="other-check" hidden></div>
-      <div class="filters" role="tablist">
-        <button class="chip-filter" data-filter="all" data-label-key="filter.all"></button>
-        <button class="chip-filter" data-filter="untagged" data-label-key="filter.untagged"></button>
-        <button class="chip-filter" data-filter="unverified" data-label-key="filter.unverified"></button>
-        <button class="chip-filter" data-filter="dupe" data-label-key="filter.dupe"></button>
-        <button class="chip-filter" data-filter="tocheck" data-label-key="filter.tocheck" hidden></button>
-        <button class="chip-filter" data-filter="other" data-label-key="filter.other" hidden></button>
-        <button class="chip-filter" data-filter="void" data-label-key="filter.void"></button>
-      </div>
-      <input id="search" class="search" type="search" data-i18n-ph="search.ph">
+    <section class="card" id="listCard" hidden>
+      <h2 data-i18n="list.title"></h2>
+      <p class="hint" data-i18n="list.hint"></p>
+      <p id="untagged" class="hint warn-text" hidden></p>
       <div id="receipts"></div>
-      <details class="preview">
-        <summary data-i18n="history">Change history (audit log)</summary>
-        <div id="history"></div>
-      </details>
     </section>
 
-    <section class="card" id="statementsCard" hidden>
-      <h2 data-i18n="st.title">Bank &amp; card statements</h2>
-      <p class="hint" data-i18n="st.hint"></p>
-      <div id="statements"></div>
-    </section>
-
-    <section class="card" id="sendCard" hidden>
-      <h2 data-i18n="send.title">3. Report &amp; send</h2>
+    <section class="card" id="splitCard" hidden>
+      <h2 data-i18n="split.title"></h2>
       <div class="two-col">
-        <label class="field"><span data-i18n="send.from">From date</span><input id="periodFrom" type="date"></label>
-        <label class="field"><span data-i18n="send.to">To date</span><input id="periodTo" type="date"></label>
+        <label class="field"><span data-i18n="split.from"></span><input id="periodFrom" type="date"></label>
+        <label class="field"><span data-i18n="split.to"></span><input id="periodTo" type="date"></label>
       </div>
-      <label class="field">
-        <span data-i18n="send.emailTo">Email to</span>
-        <input id="emailTo" type="email" inputmode="email" autocomplete="email" placeholder="you@example.com">
-      </label>
-      <label class="field">
-        <span data-i18n="send.subject">Subject</span>
-        <input id="emailSubject" type="text">
-      </label>
-      <div class="row wrap">
-        <button id="shareBtn" class="btn primary" data-i18n="btn.shareReport">Send report (PDF + Excel)</button>
+      <div id="account"></div>
+      <div class="row">
+        <button id="exportBtn" class="btn" data-i18n="btn.export"></button>
       </div>
-      <details class="more">
-        <summary data-i18n="send.more">More options…</summary>
-        <div class="row wrap">
-        <button id="emailBtn" class="btn" data-i18n="btn.emailPlain">Email (summary only)</button>
-        <button id="pdfBtn" class="btn" data-i18n="btn.pdf">Download PDF</button>
-        <button id="csvBtn" class="btn" data-i18n="btn.csv">Download Excel (.xlsx)</button>
-        <button id="exXlsxBtn" class="btn" data-i18n="btn.exXlsx">Excel for the other parent</button>
-        <button id="packShareBtn" class="btn" data-i18n="btn.share">Share evidence pack (.zip)</button>
-        <button id="zipBtn" class="btn" data-i18n="btn.zip">Download evidence pack (.zip)</button>
-        <button id="richCopyBtn" class="btn" data-i18n="btn.richCopy">Copy coloured summary</button>
-        <button id="copyBtn" class="btn" data-i18n="btn.copy">Copy summary</button>
-        </div>
-      </details>
-      <p class="hint" data-i18n="send.hint"></p>
-      <details class="preview">
-        <summary data-i18n="send.preview">Email preview</summary>
-        <pre id="emailPreview"></pre>
-      </details>
     </section>
   </main>
 
   <dialog id="settingsDialog">
     <form method="dialog" class="settings">
-      <h2 data-i18n="settings">Settings</h2>
+      <h2 data-i18n="settings"></h2>
       <label class="field">
-        <span data-i18n="set.lang">Language</span>
+        <span data-i18n="set.lang"></span>
         <select id="langSelect">
-          <option value="auto" data-i18n="lang.auto">Automatic (phone setting)</option>
+          <option value="auto" data-i18n="lang.auto"></option>
           <option value="en">English</option>
           <option value="fr">Français</option>
         </select>
       </label>
       <label class="field">
-        <span data-i18n="set.key">Anthropic API key</span>
+        <span data-i18n="set.key"></span>
         <input id="apiKey" type="password" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
       </label>
       <label class="field">
-        <span data-i18n="set.model">Model</span>
+        <span data-i18n="set.model"></span>
         <select id="model">
-          <option value="claude-opus-5-5" data-i18n="model.opus">Claude Opus 5.5 (most accurate)</option>
-          <option value="claude-sonnet-5-5" data-i18n="model.sonnet">Claude Sonnet 5.5 (balanced)</option>
-          <option value="claude-haiku-5-5" data-i18n="model.haiku">Claude Haiku 5.5 (cheapest)</option>
+          <option value="claude-opus-5-5" data-i18n="model.opus"></option>
+          <option value="claude-sonnet-5-5" data-i18n="model.sonnet"></option>
+          <option value="claude-haiku-5-5" data-i18n="model.haiku"></option>
         </select>
       </label>
       <label class="field">
         <span data-i18n="set.kids"></span>
         <textarea id="kidsContext" rows="2"></textarea>
       </label>
-      <label class="field">
-        <span data-i18n="set.split"></span>
-        <input id="splitDefault" type="number" min="0" max="100" step="1" placeholder="50">
-      </label>
-      <label class="field">
-        <span data-i18n="set.parentShare"></span>
-        <input id="parentShare" type="number" min="0" max="100" step="any" inputmode="decimal" placeholder="50">
-      </label>
-      <label class="field">
-        <span data-i18n="set.recipient">Default recipient</span>
-        <input id="defaultEmail" type="email" inputmode="email" placeholder="you@example.com">
-      </label>
-      <label class="field">
-        <span data-i18n="set.currency"></span>
-        <input id="defaultCurrency" type="text" maxlength="3">
-      </label>
-      <label class="field">
-        <span data-i18n="set.types"></span>
-        <textarea id="expTypes" rows="5"></textarea>
-      </label>
-      <label class="check">
-        <input id="autoTag" type="checkbox">
-        <span data-i18n-html="set.autotag"></span>
-      </label>
-      <p class="hint" data-i18n="set.keyhint"></p>
+      <div class="two-col">
+        <label class="field">
+          <span data-i18n="set.share"></span>
+          <input id="parentShare" type="number" min="0" max="100" step="any" inputmode="decimal" placeholder="50">
+        </label>
+        <label class="field">
+          <span data-i18n="set.currency"></span>
+          <input id="defaultCurrency" type="text" maxlength="3">
+        </label>
+      </div>
       <div class="row">
-        <button value="save" class="btn primary" data-i18n="set.save">Save</button>
-        <button value="cancel" class="btn ghost" formnovalidate data-i18n="set.cancel">Cancel</button>
+        <button value="save" class="btn primary" data-i18n="set.save"></button>
+        <button value="cancel" class="btn ghost" formnovalidate data-i18n="set.cancel"></button>
       </div>
       <hr>
-      <h3 data-i18n="backup.title">Backup</h3>
+      <h3 data-i18n="backup.title"></h3>
       <p class="hint" data-i18n="backup.hint"></p>
       <div class="row wrap">
-        <button type="button" id="backupBtn" class="btn" data-i18n="backup.btn">Back up everything (.zip)</button>
+        <button type="button" id="backupBtn" class="btn" data-i18n="backup.btn"></button>
         <label class="btn">
           <input id="restoreInput" type="file" accept=".zip,application/zip" hidden>
-          <span data-i18n="restore.btn">Restore from backup…</span>
+          <span data-i18n="restore.btn"></span>
         </label>
       </div>
       <hr>
-      <button type="button" id="wipeBtn" class="btn ghost danger" data-i18n="wipe.btn">Erase all data on this device…</button>
-    </form>
-  </dialog>
-
-  <dialog id="manualDialog">
-    <form method="dialog" class="settings" id="manualForm">
-      <h2 data-i18n="man.title">Manual entry</h2>
-      <p class="hint" id="manualFile"></p>
-      <label class="field"><span data-i18n="man.store">Store / payee</span><input id="mStore" type="text" required></label>
-      <div class="two-col">
-        <label class="field"><span data-i18n="man.date">Date</span><input id="mDate" type="date"></label>
-        <label class="field"><span data-i18n="man.currency">Currency</span><input id="mCurrency" type="text" maxlength="3"></label>
-      </div>
-      <div class="two-col">
-        <label class="field"><span data-i18n="man.payment">Payment method</span><input id="mPayment" type="text"></label>
-        <label class="field"><span data-i18n="man.doctype">Document</span>
-          <select id="mDocType">
-            <option value="receipt" data-i18n="doc.receipt">Receipt</option>
-            <option value="invoice" data-i18n="doc.invoice">Invoice</option>
-            <option value="other" data-i18n="doc.other">Other</option>
-          </select>
-        </label>
-      </div>
-      <div class="field"><span data-i18n="man.items">Lines (description and amount)</span>
-        <div id="mItems" class="man-items"></div>
-        <button type="button" id="mAddLine" class="btn small" data-i18n="man.addLine">+ Add a line</button>
-      </div>
-      <div class="two-col">
-        <label class="field"><span data-i18n="man.tax">Tax (optional)</span><input id="mTax" type="text" inputmode="decimal"></label>
-        <label class="field"><span data-i18n="man.total">Total (blank = lines + tax)</span><input id="mTotal" type="text" inputmode="decimal"></label>
-      </div>
-      <label class="field"><span data-i18n="man.note">Note (optional)</span><input id="mNote" type="text"></label>
-      <div class="row wrap">
-        <button value="save" class="btn primary" data-i18n="man.save">Save</button>
-        <button value="again" class="btn" data-i18n="man.again">Save &amp; add another</button>
-        <button value="cancel" class="btn ghost" formnovalidate data-i18n="set.cancel">Cancel</button>
-      </div>
+      <button type="button" id="wipeBtn" class="btn ghost danger" data-i18n="wipe.btn"></button>
     </form>
   </dialog>
 
