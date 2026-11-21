@@ -3004,7 +3004,17 @@ if ("launchQueue" in window) {
 }
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("sw.js").catch((err) => console.warn("SW registration failed", err));
+  navigator.serviceWorker.register("sw.js", { updateViaCache: "none" })
+    .then((reg) => reg.update())
+    .catch((err) => console.warn("SW registration failed", err));
+  // A new version took over: reload once so the page runs the new code.
+  // (Not on the very first visit, when there was no previous version.)
+  let reloaded = !navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (reloaded || processing) return;
+    reloaded = true;
+    location.reload();
+  });
 }
 
 // Ask the browser not to evict our stored evidence when space runs low.
