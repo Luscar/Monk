@@ -287,3 +287,8 @@ tr.type-row .type-select { max-width: none; margin-top: 0; }
 .chip-filter[hidden], .other-check[hidden] { display: none; }
 /* Sensitive file in the queue: its buttons go on their own row so the name and status keep the full width. */
 .queue li.wide-actions .qactions { grid-column: 1 / -1; }
+
+/* Photos from the other parent's spreadsheet, shown on the grid row they back up */
+.vf-photos { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.vf-photo { padding: 0; border: 0; background: none; cursor: zoom-in; border-radius: 8px; }
+.vf-photo .thumb { display: block; }

@@ -221,6 +221,15 @@ function nextReceiptId() {
   return `R-${new Date().getFullYear()}-${String(seq).padStart(4, "0")}`;
 }
 
+/**
+ * Photos pasted into the other parent's spreadsheet only serve to check the grid: their entries get IDs
+ * of their own (P-…) so the receipt numbering (R-…) has no gaps, and they stay out of the lists and totals.
+ */
+function nextPhotoId() {
+  const n = 1 + Math.max(0, ...receipts.map((r) => Number((r.id.match(/^P-\d+-(\d+)$/) || [])[1] || 0)));
+  return `P-${new Date().getFullYear()}-${String(n).padStart(4, "0")}`;
+}
+
 // ---------------------------------------------------------------------------
 // DOM helpers
 // ---------------------------------------------------------------------------
@@ -535,7 +544,7 @@ async function createReceipts(file, extracted) {
     const r = {
       ...x,
       source_ref: x.source_ref || null,
-      id: nextReceiptId(),
+      id: file.parentId ? nextPhotoId() : nextReceiptId(),
       fileId: file.id,
       source: file.name,
       sha256: file.sha256,
@@ -688,7 +697,7 @@ const dupKey = (r) => `${(r.store_name || "").toLowerCase().trim()}|${r.date || 
 /** Active receipts (not made from a statement) with the same total within ±3 days. */
 function sameAmountNearby(amount, date, exceptId) {
   const day = (d) => (d ? Date.parse(d) / 86400000 : NaN);
-  return receipts.filter((r) => !r.voided && !r.fromStatement && r.id !== exceptId
+  return receipts.filter((r) => !r.voided && !r.fromStatement && r.id !== exceptId && listed(r)
     && Math.abs(receiptTotal(r) - amount) < 0.011 && Math.abs(day(r.date) - day(date)) <= 3);
 }
 
@@ -701,7 +710,7 @@ function duplicateIds() {
     }
   }
   for (const r of receipts) {
-    if (r.voided) continue;
+    if (r.voided || !listed(r)) continue;
     const k = dupKey(r);
     groups.set(k, [...(groups.get(k) || []), r.id]);
   }
@@ -770,7 +779,7 @@ function verifyOther() {
   const proofs = other.filter((r) => !r.declared);
   const res = new Map(other.map((r) => [r.id, { kind: r.declared ? "declared" : "proof", match: null, auto: false, issues: [] }]));
   const add = (r, level, key, vars = {}) => res.get(r.id).issues.push({ level, key, vars });
-  const ids = (list) => list.map((x) => x.id).join(", ");
+  const ids = (list) => list.map(refOf).join(", ");
 
   // 1. Match each declared row to a supporting document (manual links first, then best automatic pairs).
   const used = new Map(); // proof id → declared id
@@ -838,7 +847,7 @@ function verifyOther() {
       const rowsSum = round2(rows.reduce((sum, x) => sum + receiptTotal(x), 0));
       const pSum = round2(ps.reduce((sum, x) => sum + receiptTotal(x), 0));
       const pKids = ps.every(isTagged) ? round2(ps.reduce((sum, x) => sum + allocation(x).kids, 0)) : null;
-      const pIds = ps.map((x) => x.id).join(" + ");
+      const pIds = ps.map(refOf).join(" + ");
       if (!sameMoney(rowsSum, pSum) && !(pKids != null && sameMoney(rowsSum, pKids))) {
         add(d, rowsSum > pSum ? "bad" : "warn", rows.length > 1 ? "groupDiff" : "amountDiff",
           { a: fmtMoney(rows.length > 1 ? rowsSum : amount, c), b: fmtMoney(pSum, c), id: pIds, d: fmtMoney(rowsSum - pSum, c), ids: ids(rows) });
@@ -851,24 +860,24 @@ function verifyOther() {
       const pt = receiptTotal(p);
       const kids = isTagged(p) ? allocation(p).kids : null;
       if (!sameMoney(amount, pt) && !(kids != null && sameMoney(amount, kids))) {
-        add(d, amount > pt ? "bad" : "warn", "amountDiff", { a: fmtMoney(amount, c), b: fmtMoney(pt, c), id: p.id, d: fmtMoney(amount - pt, c) });
+        add(d, amount > pt ? "bad" : "warn", "amountDiff", { a: fmtMoney(amount, c), b: fmtMoney(pt, c), id: refOf(p), d: fmtMoney(amount - pt, c) });
       } else if (kids != null && amount > kids + 0.01) {
-        add(d, "bad", "inclNotKids", { k: fmtMoney(kids, c), id: p.id });
+        add(d, "bad", "inclNotKids", { k: fmtMoney(kids, c), id: refOf(p) });
         v.adult = round2(amount - kids);
       }
       const pa = kids == null ? adultPart(p) : null;
       if (pa?.amount > 0 && amount > pt - pa.amount + 0.01) {
-        add(d, "bad", "inclAdult", { a: fmtMoney(pa.amount, c), items: pa.items, id: p.id });
+        add(d, "bad", "inclAdult", { a: fmtMoney(pa.amount, c), items: pa.items, id: refOf(p) });
         v.adult = Math.max(v.adult || 0, round2(Math.min(amount, pa.amount)));
       }
-      if (d.date && p.date && daysApart(d.date, p.date) > 7) add(d, "warn", "dateDiff", { a: d.date, b: p.date, id: p.id });
+      if (d.date && p.date && daysApart(d.date, p.date) > 7) add(d, "warn", "dateDiff", { a: d.date, b: p.date, id: refOf(p) });
     }
     const twice = declared.filter((x) => x.id !== d.id && curOf(x) === c && sameMoney(receiptTotal(x), amount)
       && ((d.date && x.date === d.date) || (daysApart(x.date, d.date) <= 3 && similar(x, d))));
     if (twice.length) add(d, "bad", "twice", { ids: ids(twice) });
     if (p) {
       const shared = declared.filter((x) => x.id !== d.id && x.justifiedBy === p.id && !(v.byRef && res.get(x.id).byRef));
-      if (shared.length) add(d, "bad", "proofShared", { id: p.id, ids: ids(shared) });
+      if (shared.length) add(d, "bad", "proofShared", { id: refOf(p), ids: ids(shared) });
     }
     const paidByMe = mine.filter((x) => curOf(x) === c && sameMoney(receiptTotal(x), amount) && daysApart(x.date, d.date) <= 3);
     if (paidByMe.length) add(d, "bad", "paidByMe", { ids: ids(paidByMe) });
@@ -896,7 +905,7 @@ function verifyOther() {
     if (f?.img?.dhash) {
       const same = imgFiles.filter((g) => g.id !== f.id && g.img.dhash.length === f.img.dhash.length && hamming(g.img.dhash, f.img.dhash) <= 24);
       const rIds = same.flatMap((g) => g.receiptIds || []).filter((id) => getReceipt(id) && !getReceipt(id).voided);
-      if (rIds.length) add(p, "bad", "samePhoto", { ids: [...new Set(rIds)].join(", ") });
+      if (rIds.length) add(p, "bad", "samePhoto", { ids: [...new Set(rIds)].map((id) => refOf(getReceipt(id))).join(", ") });
     }
     const num = String(p.receipt_number || "").replace(/\W/g, "");
     if (num.length >= 4) {
@@ -913,11 +922,21 @@ function verifyOther() {
     if (ex?.taken) add(p, "info", "taken", { t: ex.taken.replace("T", " "), cam: [ex.make, ex.model].filter(Boolean).map((x, i) => (i ? " " : " · ") + x).join("") });
     else if (f?.kind === "image") add(p, "info", "noExif");
   }
-  // A declared line is only as good as the document behind it.
+  // A declared line is only as good as the document behind it. Photos from the spreadsheet aren't listed
+  // on their own, so their problems are shown on the row they back up.
   for (const d of declared) {
     const v = res.get(d.id);
-    const pv = v.match && res.get(v.match);
-    if (pv?.issues.some((i) => i.level === "bad")) add(d, "warn", "proofFlagged", { id: v.match });
+    for (const pid of v.matches || (v.match ? [v.match] : [])) {
+      const p = getReceipt(pid);
+      const pv = res.get(pid);
+      if (!p || !pv) continue;
+      if (gridPhoto(p)) {
+        for (const i of pv.issues) {
+          if (i.level === "info" || i.key === "adultItems") continue; // the row's own check covers adult items
+          add(d, i.level, "fromPhoto", { p: photoLabel(p), msg: issueText(i) });
+        }
+      } else if (pv.issues.some((i) => i.level === "bad")) add(d, "warn", "proofFlagged", { id: pid });
+    }
   }
   for (const v of res.values()) {
     v.level = v.issues.some((i) => i.level === "bad") ? "bad" : v.issues.some((i) => i.level === "warn") ? "warn" : "ok";
@@ -934,7 +953,7 @@ function verifySummary(list, ver = verifyOther()) {
   const by = {};
   for (const r of list) {
     const v = ver.get(r.id);
-    if (!v || r.voided) continue;
+    if (!v || r.voided || gridPhoto(r)) continue;
     const c = curOf(r);
     const x = by[c] ??= { c, declared: 0, nDeclared: 0, backed: 0, nBacked: 0, noProof: 0, nNoProof: 0, diff: 0, nDiff: 0,
       disputed: 0, nDisputed: 0, adult: 0, nAdult: 0, nProofs: 0, nFlagged: 0, nToCheck: 0 };
@@ -963,7 +982,7 @@ function verifyText(r, v) {
   if (!v) return "";
   const p = v.kind === "declared" && v.match && getReceipt(v.match);
   const head = v.kind === "declared"
-    ? (p ? t("vf.backedBy", { id: (v.matches || [p.id]).join(" + "), m: matchHow(r, v) }) : t("vf.noProofShort"))
+    ? (p ? t("vf.backedBy", { id: (v.matches || [p.id]).map(getReceipt).filter(Boolean).map((x) => (gridPhoto(x) ? photoLabel(x) : x.id)).join(" + "), m: matchHow(r, v) }) : t("vf.noProofShort"))
     : t("vf.proofShort");
   const probs = v.issues.filter((i) => i.level !== "info").map(issueText);
   const dec = r.check?.decision === "accepted" ? t("vf.acceptedShort")
@@ -1174,7 +1193,7 @@ async function applySuggestions(r) {
 }
 
 async function applyAllSuggestions() {
-  const targets = receipts.filter((r) => suggestableCount(r));
+  const targets = receipts.filter((r) => listed(r) && suggestableCount(r));
   const total = targets.reduce((s, r) => s + suggestableCount(r), 0);
   if (!total || !confirm(t("c.applyAll", { n: total, r: targets.length }))) return;
   for (const r of targets) {
@@ -1199,6 +1218,16 @@ async function shareOrDownload(file, title) {
 }
 
 const fileOf = (r) => files.find((x) => x.id === r.fileId);
+/** An entry read from a photo inside the other parent's spreadsheet: only used to check the grid's rows. */
+const gridPhoto = (r) => !!fileOf(r)?.parentId;
+const listed = (r) => !gridPhoto(r);
+/** How to name an entry in messages: its ID, or "photo n° 14" for a photo from the spreadsheet. */
+const refOf = (r) => (gridPhoto(r) ? photoLabel(r) : r.id);
+/** Short label of a spreadsheet photo, e.g. "photo n° 14 (Factures)". */
+function photoLabel(p) {
+  const f = fileOf(p);
+  return t("vf.photoLabel", { n: f?.invoiceRef || p.invoice_ref || p.id, sheet: f?.sheet || "" });
+}
 
 /** Save the untouched original (e.g. into Photos via the share sheet). */
 async function saveOriginal(r) {
@@ -1295,10 +1324,13 @@ function viewOriginal(r) {
 async function removeFile(id) {
   const f = files.find((x) => x.id === id);
   if (!f || f.status === "done") return;
-  files = files.filter((x) => x.id !== id);
-  thumbs.delete(id);
-  await db.del("files", id);
-  await log("file_removed", "", t("lg.removed", { name: f.name }));
+  const gone = [f, ...files.filter((x) => x.parentId === id && x.status !== "done" && x.status !== "working" && x.status !== "queued")];
+  for (const g of gone) {
+    files = files.filter((x) => x.id !== g.id);
+    thumbs.delete(g.id);
+    await db.del("files", g.id);
+    await log("file_removed", "", t("lg.removed", { name: g.name }));
+  }
   render();
 }
 
@@ -1500,6 +1532,7 @@ function reportReceipts() {
   const from = $("#periodFrom").value;
   const to = $("#periodTo").value;
   return receipts
+    .filter(listed)
     .filter((r) => (!from || (r.date && r.date >= from)) && (!to || (r.date && r.date <= to)))
     .sort((a, b) => (a.date || "9999").localeCompare(b.date || "9999") || a.id.localeCompare(b.id));
 }
@@ -1885,7 +1918,7 @@ async function restorePack(zipFile) {
     await db.add("log", { ...e });
   }
   logEntries.sort((a, b) => a.ts.localeCompare(b.ts));
-  const maxId = Math.max(seq, data.seq || 0, ...receipts.map((r) => Number((r.id.match(/-(\d+)$/) || [])[1] || 0)));
+  const maxId = Math.max(seq, data.seq || 0, ...receipts.map((r) => Number((r.id.match(/^R-\d+-(\d+)$/) || [])[1] || 0)));
   if (maxId !== seq) { seq = maxId; await db.put("meta", seq, "seq"); }
   receipts.sort((a, b) => a.id.localeCompare(b.id));
 
@@ -2429,9 +2462,29 @@ function thumbFor(f) {
 function render() {
   $("#setupNotice").hidden = !!settings.apiKey;
 
-  // Intake queue: only files not yet extracted.
+  // Intake queue: only files not yet extracted. Photos taken out of a spreadsheet show as one line per
+  // spreadsheet: they are only read to check the grid.
   const open = files.filter((f) => f.status !== "done");
-  $("#queue").replaceChildren(...open.map((f) => h("li", { class: f.sensitive ? "wide-actions" : null },
+  const photoGroups = new Map();
+  for (const f of open) if (f.parentId) photoGroups.set(f.parentId, [...(photoGroups.get(f.parentId) || []), f]);
+  const groupItem = ([parentId, list]) => {
+    const parent = files.find((x) => x.id === parentId);
+    const err = list.find((f) => f.status === "error");
+    const busy = list.some((f) => f.status === "working" || f.status === "queued");
+    const st = err ? "error" : busy ? "working" : list.every((f) => f.status === "manual") ? "manual" : "pending";
+    return h("li", {},
+      h("div", { class: "thumb", "aria-hidden": "true" }, "📷"),
+      h("div", {},
+        h("div", { class: "qname" }, t("q.gridPhotos", { n: list.length, name: parent?.name || "" })),
+        h("div", { class: `qstatus ${st}` }, err ? `${err.name}: ${err.error}` : `${STATUS_LABEL[st]} · ${t("q.gridPhotosHint")}`)),
+      h("div", { class: "qactions" },
+        h("button", {
+          class: "btn small ghost", "aria-label": t("remove", { name: t("q.gridPhotos", { n: list.length, name: parent?.name || "" }) }),
+          disabled: busy,
+          onclick: async () => { for (const f of list) await removeFile(f.id); },
+        }, "✕")));
+  };
+  $("#queue").replaceChildren(...open.filter((f) => !f.parentId).map((f) => h("li", { class: f.sensitive ? "wide-actions" : null },
     thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" })
       : h("div", { class: "thumb", "aria-hidden": "true" }, f.role === "statement" ? "🏦" : f.kind === "pdf" ? "📄" : f.kind === "sheet" ? "📊" : "🧾"),
     h("div", {},
@@ -2449,26 +2502,27 @@ function render() {
         class: "btn small ghost", "aria-label": t("remove", { name: f.name }),
         disabled: f.status === "working" || f.status === "queued",
         onclick: () => removeFile(f.id),
-      }, "✕")))));
-  const doneCount = files.length - open.length;
+      }, "✕")))), ...[...photoGroups].map(groupItem));
+  const doneCount = files.filter((f) => f.status === "done" && !f.parentId).length;
+  const shown = receipts.filter(listed);
   const last = store.get("lastBackup");
   const days = last ? Math.floor((Date.now() - Date.parse(last)) / 86_400_000) : null;
-  const backupNote = !receipts.length ? ""
+  const backupNote = !shown.length ? ""
     : last === "" ? t("bk.never")
     : days >= 7 ? t("bk.old", { d: days }) : t("bk.last", { ts: fmtTs(last) });
-  $("#processedCount").textContent = doneCount ? t("processed", { f: doneCount, r: receipts.length }) + backupNote : "";
+  $("#processedCount").textContent = doneCount ? t("processed", { f: doneCount, r: shown.length }) + backupNote : "";
 
   const pending = files.filter((f) => f.status === "pending" || f.status === "error").length;
   const pb = $("#processBtn");
   pb.disabled = processing || pending === 0;
   pb.textContent = processing ? t("process.working") : pending ? t("process.count", { n: pending }) : t("process.idle");
 
-  $("#resultsCard").hidden = receipts.length === 0;
-  $("#sendCard").hidden = receipts.length === 0;
-  if (!receipts.length) { renderStatements(); return; }
+  $("#resultsCard").hidden = shown.length === 0;
+  $("#sendCard").hidden = shown.length === 0;
+  if (!shown.length) { renderStatements(); return; }
 
-  // Totals (all non-voided receipts)
-  const active = receipts.filter((r) => !r.voided);
+  // Totals (all non-voided receipts; photos from a spreadsheet only check the grid and aren't counted)
+  const active = shown.filter((r) => !r.voided);
   const totals = totalsFor(active);
   const stats = [];
   const anyTagged = active.some(isTagged);
@@ -2482,7 +2536,7 @@ function render() {
   }
   stats.push([t("stat.receipts"), active.length]);
 
-  const suggestable = receipts.reduce((n, r) => n + suggestableCount(r), 0);
+  const suggestable = shown.reduce((n, r) => n + suggestableCount(r), 0);
   const ab = $("#applyAllBtn");
   ab.hidden = !suggestable;
   ab.textContent = t("applyAll", { n: suggestable });
@@ -2501,7 +2555,7 @@ function render() {
     untagged: active.filter((r) => allocation(r).pending > 0).length,
     unverified: active.filter((r) => !r.reviewed).length,
     dupe: dupes.size,
-    void: receipts.length - active.length,
+    void: shown.length - active.length,
     other: active.filter((r) => r.payer === "other").length,
   };
   document.querySelectorAll(".chip-filter").forEach((b) => {
@@ -2512,7 +2566,7 @@ function render() {
   });
 
   const q = query.toLowerCase();
-  const visible = receipts
+  const visible = shown
     .filter((r) => {
       if (filter === "void") return r.voided;
       if (r.voided) return false;
@@ -2587,7 +2641,7 @@ function renderTxRows(f) {
     let picker = null;
     if (linkOpen === key && !use) {
       const cands = proofCandidates(tx);
-      const others = receipts.filter((r) => !r.voided && !r.fromStatement)
+      const others = receipts.filter((r) => !r.voided && !r.fromStatement && listed(r))
         .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
       picker = h("div", { class: "tx-picker" },
         h("div", { class: "meta" }, cands.length ? t("st.candidates") : t("st.noCandidates")),
@@ -2634,6 +2688,7 @@ function renderOtherCheck(ver) {
   const line = (cls, label, n, amt, c) => h("div", { class: `vf-row ${cls}` },
     h("span", {}, label, h("span", { class: "count" }, n)), h("b", {}, amt == null ? "" : fmtMoney(amt, c)));
   const toCheck = sums.reduce((n, x) => n + x.nToCheck, 0);
+  const orphans = receipts.filter((r) => !r.voided && r.payer === "other" && gridPhoto(r) && !ver.get(r.id)?.match);
   card.replaceChildren(
     h("h3", {}, t("vf.title")),
     ...sums.map((x) => h("div", { class: "vf-sum" },
@@ -2647,6 +2702,9 @@ function renderOtherCheck(ver) {
       ] : null,
       x.nProofs ? line(x.nFlagged ? "bad" : "ok", t("vf.sProofs", { n: x.nFlagged }), x.nProofs, null, x.c) : null,
       x.nDisputed ? line("bad", t("vf.sDisputed"), x.nDisputed, x.disputed, x.c) : null)),
+    orphans.length ? h("div", { class: "vf-row warn" },
+      h("span", {}, t("vf.sOrphanPhotos"), h("span", { class: "count" }, orphans.length)),
+      h("span", { class: "meta" }, orphans.map((p) => `${photoLabel(p)} ${fmtMoney(receiptTotal(p), curOf(p))}`).join(" · "))) : null,
     h("p", { class: "hint" }, t("vf.hint")),
     toCheck ? h("button", { class: "btn small primary", onclick: () => { filter = "tocheck"; render(); } }, t("vf.show", { n: toCheck }))
       : h("p", { class: "hint ok" }, t("vf.allDone")));
@@ -2656,10 +2714,15 @@ function renderOtherCheck(ver) {
 function renderCheckBlock(r, v, ver) {
   const c = curOf(r);
   const p = v.kind === "declared" && v.match && getReceipt(v.match);
+  const backing = p ? (v.matches || [p.id]).map(getReceipt).filter(Boolean) : [];
+  const photos = backing.filter((x) => gridPhoto(x) && thumbFor(fileOf(x)));
   const head = v.kind === "declared"
-    ? (p ? h("div", { class: "vf-head ok" }, t("vf.backedBy", { id: (v.matches || [p.id]).join(" + "), m: matchHow(r, v) }),
-      h("span", { class: "meta" }, ` — ${(v.matches || [p.id]).map(getReceipt)
-        .map((x) => `${x.store_name || ""} ${x.date || ""} ${fmtMoney(receiptTotal(x), curOf(x))}`.trim()).join(" · ")}`))
+    ? (p ? h("div", { class: "vf-head ok" }, t("vf.backedBy", { id: backing.map((x) => (gridPhoto(x) ? photoLabel(x) : x.id)).join(" + "), m: matchHow(r, v) }),
+      h("span", { class: "meta" }, ` — ${backing
+        .map((x) => `${x.store_name || ""} ${x.date || ""} ${fmtMoney(receiptTotal(x), curOf(x))}`.trim()).join(" · ")}`),
+      photos.length ? h("div", { class: "vf-photos" }, photos.map((x) => h("button", {
+        class: "vf-photo", title: t("btn.view"), "aria-label": `${t("btn.view")} ${photoLabel(x)}`, onclick: () => viewOriginal(x),
+      }, h("img", { class: "thumb", src: thumbFor(fileOf(x)), alt: "" })))) : null)
       : h("div", { class: "vf-head warn" }, t("vf.noProofShort")))
     : (v.match ? h("div", { class: "vf-head ok" }, t("vf.supports", { id: v.match })) : h("div", { class: "vf-head" }, t("vf.proofShort")));
   const issues = v.issues.map((i) => h("li", { class: i.level }, issueText(i)));
@@ -2672,7 +2735,7 @@ function renderCheckBlock(r, v, ver) {
       onchange: (e) => setJustification(r, e.target.value),
     }, h("option", { value: "", selected: !r.justifiedBy }, t("vf.linkAuto")),
     cands.map((x) => h("option", { value: x.id, selected: x.id === r.justifiedBy },
-      `${x.id} · ${x.date || "—"} · ${x.store_name || ""} · ${fmtMoney(receiptTotal(x), curOf(x))}`)));
+      `${gridPhoto(x) ? photoLabel(x) : x.id} · ${x.date || "—"} · ${x.store_name || ""} · ${fmtMoney(receiptTotal(x), curOf(x))}`)));
   }
   const dec = r.check?.decision;
   return h("div", { class: `vf-block ${dec || v.level}` },
