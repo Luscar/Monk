@@ -48,6 +48,8 @@ const settings = {
 
 // Models that support server-side refusal fallbacks ("default" routing).
 const FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-sonnet-5-5"]);
+/** Shown in Settings so you can check the phone runs the latest code. Keep in step with CACHE in sw.js. */
+const APP_VERSION = "21";
 const CONCURRENCY = 3;
 const MAX_IMAGE_EDGE = 2400;
 const MAX_PDF_BYTES = 25 * 1024 * 1024;
@@ -2794,6 +2796,7 @@ function openSettings() {
   $("#kidsContext").value = settings.kidsContext;
   $("#splitDefault").value = store.get("splitDefault");
   $("#parentShare").value = store.get("parentShare");
+  $("#appVersion").textContent = t("set.version", { v: APP_VERSION });
   $("#autoTag").checked = settings.autoTag;
   $("#expTypes").value = store.get("expTypes") || t("types.default");
   $("#langSelect").value = store.get("lang") || "auto";
@@ -2941,7 +2944,22 @@ if ("launchQueue" in window) {
 }
 
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("sw.js").catch((err) => console.warn("SW registration failed", err));
+  // When a new version takes over, reload once so the new code runs (iOS home-screen apps often stay
+  // in memory and would otherwise keep running the old one).
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloading = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || reloading || processing) return;
+    reloading = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register("sw.js", { updateViaCache: "none" })
+    .then((reg) => {
+      reg.update().catch(() => {});
+      // Check again whenever the app comes back to the foreground.
+      document.addEventListener("visibilitychange", () => { if (!document.hidden) reg.update().catch(() => {}); });
+    })
+    .catch((err) => console.warn("SW registration failed", err));
 }
 
 // Ask the browser not to evict our stored evidence when space runs low.

@@ -1,5 +1,5 @@
-// Bump this when you change any app file so installed copies update.
-const CACHE = "receipt-mailer-v20";
+// Bump this when you change any app file so installed copies update (and APP_VERSION in app.js).
+const CACHE = "receipt-mailer-v21";
 const SHELL = [
   "./",
   "./index.html",
@@ -36,7 +36,9 @@ self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
   event.respondWith(
-    fetch(event.request)
+    // "no-cache": always ask the server (it answers 304 if unchanged), never the browser's HTTP cache,
+    // so a fix that was just published is picked up on the next launch.
+    fetch(event.request, { cache: "no-cache" })
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
