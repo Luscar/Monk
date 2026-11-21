@@ -1,5 +1,5 @@
 // Bump this when you change any app file so installed copies update.
-const CACHE = "receipt-mailer-v21";
+const CACHE = "receipt-mailer-v22";
 const SHELL = [
   "./",
   "./index.html",
@@ -35,8 +35,10 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.origin !== self.location.origin) return;
+  // "no-cache": always ask the server (GitHub Pages lets browsers keep files 10 minutes otherwise),
+  // so a new version shows up on the next opening.
   event.respondWith(
-    fetch(event.request)
+    fetch(event.request, { cache: "no-cache" })
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
