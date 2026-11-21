@@ -3,6 +3,7 @@
 A small installable web app that does three things:
 
 1. **Collect** receipts from the camera, the photo gallery or PDF files (one file can hold several receipts). Pick *Paid by: Me / Other parent* before adding.
+   **Excel** imports an expense list someone typed (.xlsx or .csv): only the cell values are sent to Claude, which turns each expense row into an entry (marked with its sheet and row, e.g. `Sheet1 L12`) and skips headers, totals and side calculations. Pictures pasted in the workbook are ignored. Old .xls/.numbers/.ods files must be saved as .xlsx or .csv first.
 2. **Extract only what's needed to split them.** Claude reads each file with your own Anthropic API key and returns just the store, date, currency, each line (name + amount), tax and total. Each line comes back pre-tagged: clearly for a child → **Kids**, clearly for an adult → **Not kids**, shared household items → **?** for you to decide. Tap a tag to cycle *Kids → Split % → Not kids → ?*. Tap an amount to fix it.
 3. **Split.** For any date range: kids' expenses paid by you and by the other parent, each parent's share (Settings → *My share*, 50 % by default) and who owes whom. Tax is shared out in proportion to the line amounts; a discount line follows the item above it. *Download spreadsheet* gives an .xlsx with the split and every kids' line.
 
@@ -36,6 +37,6 @@ On your phone: enable GitHub Pages for this repo (Settings → Pages → deploy 
 | `index.html`, `styles.css` | UI |
 | `i18n.js` | English/French text and language detection |
 | `app.js` | File intake, image prep, Claude calls (structured JSON output), tagging, split, export, backup |
-| `db.js`, `zip.js`, `xlsx.js` | IndexedDB storage, .zip and .xlsx writers |
+| `db.js`, `zip.js`, `xlsx.js` | IndexedDB storage, .zip writer/reader, .xlsx writer and .xlsx/.csv reader |
 | `vendor/anthropic-sdk.js` | Bundled official `@anthropic-ai/sdk` 1.10.0 (ESM, browser) |
 | `sw.js`, `manifest.webmanifest`, `icons/` | PWA install + offline shell |

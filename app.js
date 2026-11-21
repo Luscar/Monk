@@ -1,7 +1,7 @@
 import Anthropic from "./vendor/anthropic-sdk.js";
 import { db } from "./db.js";
 import { makeZip, readZip } from "./zip.js";
-import { makeXlsx } from "./xlsx.js";
+import { makeXlsx, readXlsx, readCsv, sheetsToText } from "./xlsx.js";
 import { t, locale, regionCurrency, applyStatic } from "./i18n.js";
 
 // ---------------------------------------------------------------------------
@@ -53,9 +53,10 @@ const RECEIPT_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["store_name", "date", "currency", "items", "tax", "total"],
+        required: ["store_name", "date", "currency", "items", "tax", "total", "source_ref"],
         properties: {
           store_name: { type: "string" },
+          source_ref: { type: "string", description: "Spreadsheets only: sheet and row, e.g. 'Sheet1 L12'. Empty string for photos/PDFs" },
           date: { ...nullable("string"), description: "Purchase date YYYY-MM-DD" },
           currency: { type: "string", description: "ISO 4217 code" },
           items: {
@@ -87,7 +88,8 @@ Rules:
 - Skip non-purchase lines (subtotals, payment, change, loyalty points, deposits returned).
 - date is the printed purchase date (YYYY-MM-DD), never today. Use null for anything not printed or not legible. Never invent values.
 - likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items (general groceries, cleaning products, fuel).
-- If the file contains no receipt, return an empty receipts array.`;
+- Spreadsheets (an expense list someone typed): each row that records an expense becomes one entry with a single line (unless the row clearly lists several), using the row's own date, description and amount. store_name is the merchant if a column gives it, otherwise a short description. source_ref is the sheet and row (e.g. "Sheet1 L12"). Skip headers, totals, subtotals, empty rows and side calculations or reference tables beside the list. tax and total are null unless the row has its own columns for them. Amounts may use a comma as decimal separator.
+- If the file contains no receipt or expense, return an empty receipts array.`;
 
 // ---------------------------------------------------------------------------
 // State
@@ -197,10 +199,13 @@ async function shareOrDownload(file) {
 // 1. Collect
 // ---------------------------------------------------------------------------
 const isPdf = (file) => file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+const isSheet = (file) => /\.(xlsx|csv)$/i.test(file.name)
+  || ["text/csv", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"].includes(file.type);
 
 async function addFiles(fileList) {
   for (const file of [...fileList]) {
-    const kind = isPdf(file) ? "pdf"
+    if (/\.(xls|numbers|ods)$/i.test(file.name)) { toast(t("t.oldSheet", { name: file.name }), 6000); continue; }
+    const kind = isPdf(file) ? "pdf" : isSheet(file) ? "sheet"
       : file.type.startsWith("image/") || /\.(heic|heif)$/i.test(file.name) ? "image" : null;
     if (!kind) { toast(t("t.unsupported", { name: file.name })); continue; }
     if (kind === "pdf" && file.size > MAX_PDF_BYTES) { toast(t("t.pdfTooBig", { name: file.name }), 4000); continue; }
@@ -258,6 +263,11 @@ async function prepareImage(blob, type) {
 // 2. Extract
 // ---------------------------------------------------------------------------
 async function fileSource(file) {
+  if (file.kind === "sheet") {
+    // Data only: the cell values are sent as text; pictures inside a workbook are ignored.
+    const sheets = /\.csv$/i.test(file.name) || file.type === "text/csv" ? readCsv(await file.blob.text()) : await readXlsx(file.blob);
+    return { type: "text", text: `<spreadsheet name="${file.name}">\n${sheetsToText(sheets)}\n</spreadsheet>` };
+  }
   if (file.kind === "pdf") {
     return { type: "document", source: { type: "base64", media_type: "application/pdf", data: await readAsBase64(file.blob) } };
   }
@@ -276,7 +286,7 @@ async function extract(client, file) {
       role: "user",
       content: [await fileSource(file), {
         type: "text",
-        text: `Extract the receipt(s) in this ${file.kind === "pdf" ? "PDF" : "image"}. If no currency is shown, assume ${settings.currency}.${kids}`,
+        text: `${file.kind === "sheet" ? "Turn each expense row of this spreadsheet into an entry" : `Extract the receipt(s) in this ${file.kind === "pdf" ? "PDF" : "image"}`} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}`,
       }],
     }],
   };
@@ -577,7 +587,7 @@ async function restore(zipFile) {
 const STATUS_LABEL = { pending: "q.pending", error: "q.pending", queued: "q.queued", working: "q.working" };
 
 /** Files waiting for extraction (files from removed features — statements, spreadsheets, hand entry — are ignored). */
-const queueFiles = () => files.filter((f) => f.status !== "done" && (f.kind === "image" || f.kind === "pdf")
+const queueFiles = () => files.filter((f) => f.status !== "done" && (f.kind === "image" || f.kind === "pdf" || f.kind === "sheet")
   && !f.sensitive && !f.parentId && f.role !== "statement");
 
 function thumbFor(f) {
@@ -593,7 +603,7 @@ function render() {
   $("#queue").replaceChildren(...open.map((f) => {
     const busy = f.status === "working" || f.status === "queued";
     return h("li", {},
-      thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" }) : h("div", { class: "thumb", "aria-hidden": "true" }, "📄"),
+      thumbFor(f) ? h("img", { class: "thumb", src: thumbFor(f), alt: "" }) : h("div", { class: "thumb", "aria-hidden": "true" }, f.kind === "sheet" ? "📊" : "📄"),
       h("div", {},
         h("div", { class: "qname" }, f.name),
         h("div", { class: `qstatus ${f.status}` }, f.status === "error" ? f.error : `${t(STATUS_LABEL[f.status])} · ${t(f.payer === "other" ? "payer.other" : "payer.me")}`)),
@@ -639,7 +649,7 @@ function renderReceipt(r) {
     h("header", {},
       h("div", {},
         h("h3", {}, r.store_name || t("unknownStore")),
-        h("div", { class: "meta" }, [r.date || t("noDate"), r.id].join(" · "))),
+        h("div", { class: "meta" }, [r.date || t("noDate"), r.id, r.source_ref].filter(Boolean).join(" · "))),
       h("button", {
         class: `badge-btn ${r.payer === "other" ? "other" : ""}`,
         onclick: () => update(r, () => { r.payer = r.payer === "other" ? "me" : "other"; }),
@@ -740,7 +750,7 @@ document.querySelectorAll("[data-payer]").forEach((b) => b.addEventListener("cli
 }));
 renderPayerToggle();
 
-for (const id of ["#cameraInput", "#galleryInput", "#pdfInput"]) {
+for (const id of ["#cameraInput", "#galleryInput", "#pdfInput", "#sheetInput"]) {
   $(id).addEventListener("change", async (e) => {
     const list = [...e.target.files];
     e.target.value = "";
