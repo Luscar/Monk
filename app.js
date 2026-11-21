@@ -78,8 +78,9 @@ const RECEIPT_SCHEMA = {
         ],
         properties: {
           store_name: { type: "string" },
-          source_ref: { ...nullable("string"), description: "Spreadsheets only: sheet and row(s), e.g. 'Feuil1 L12'. null for photos/PDFs" },
-          invoice_ref: { ...nullable("string"), description: "Spreadsheets only: the row's receipt/invoice number column (e.g. '# facture', 'No pièce'), exactly as written, e.g. '14', '27-76-77', '2@7'. null if none or for photos/PDFs" },
+          // Plain strings ("" = none): the API allows at most 16 nullable/union fields in a schema.
+          source_ref: { type: "string", description: "Spreadsheets only: sheet and row(s), e.g. 'Feuil1 L12'. Empty string for photos/PDFs" },
+          invoice_ref: { type: "string", description: "Spreadsheets only: the row's receipt/invoice number column (e.g. '# facture', 'No pièce'), exactly as written, e.g. '14', '27-76-77', '2@7'. Empty string if none or for photos/PDFs" },
           store_address: nullable("string"),
           date: { ...nullable("string"), description: "ISO date YYYY-MM-DD" },
           time: { ...nullable("string"), description: "24h HH:MM" },
@@ -136,7 +137,7 @@ Rules:
 - document_type: "receipt" if it shows a completed payment (e.g. paid, card approved, change given); "invoice" for a bill, amount due, quote or statement without proof of payment; otherwise "other".
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
 - expense_type is also only a suggestion: for items that are (or may be) for the children, pick the type from the user's list whose examples fit best; use "unknown" when unsure or when the item is not for the children.
-- Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12") and invoice_ref set to the row's receipt/invoice number column if there is one (e.g. "# facture"; keep it as written, null for "n/a", "manquante" or blank). Skip headers, totals, subtotals, empty rows, and side calculations or reference tables placed beside the list (prorata tables, income tables, working columns). Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
+- Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12") and invoice_ref set to the row's receipt/invoice number column if there is one (e.g. "# facture"; keep it as written; empty string for "n/a", "manquante" or blank). Skip headers, totals, subtotals, empty rows, and side calculations or reference tables placed beside the list (prorata tables, income tables, working columns). Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
 - authenticity_concerns: null in the normal case. Only for photos/PDFs, and only when you see concrete signs that the document may have been altered or is not genuine: digits in a different font, size or alignment than the rest, amounts or dates that look overwritten or retouched, a total that matches no printed lines, a date inconsistent with other printed dates, a digitally composed receipt. Then ONE short factual sentence saying where. Never speculate; null for spreadsheets.
 - If the file contains no receipt at all, return an empty receipts array.`;
 
@@ -533,6 +534,7 @@ async function createReceipts(file, extracted) {
   for (const x of extracted) {
     const r = {
       ...x,
+      source_ref: x.source_ref || null,
       id: nextReceiptId(),
       fileId: file.id,
       source: file.name,
