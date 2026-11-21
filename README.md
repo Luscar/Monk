@@ -43,10 +43,21 @@ Built for documenting money spent on children (e.g. in a separation or divorce):
 - **Full backup & restore** (Settings): one .zip with everything. Restoring on a new phone re-checks every fingerprint, merges without duplicates, and carries on with the ID numbering. The app reminds you when the last backup is more than 7 days old.
 - **Evidence pack (.zip)** for any date range: `report.txt`, `items.csv`, `audit-log.csv`, `manifest.csv` (fingerprints), `data.json`, `originals/` and `stamped/`, named by receipt ID. It is also your backup, so export one regularly: data lives only in this browser.
 
+## Excel for the other parent (account between parents)
+
+*Send → More options… → Excel for the other parent* builds an .xlsx limited to what concerns the other parent, for the chosen period:
+
+- **Children's lines** sheet: one row per line tagged *Kids* or *Split* (receipt ID, date, store, paid by, item, expense type, line amount, % for the children, children's amount with tax/discounts shared out, currency, and *Accepted/Disputed* for the other parent's expenses). Adult lines, untagged lines, voided receipts, fingerprints, Claude's suggestions, private notes and flags are left out.
+- **Account** sheet: per currency, children's expenses paid by me / by the other parent, the total, each parent's share and the balance (who owes whom). Each parent's share comes from Settings → *My share of the children's expenses* (50 % by default). Disputed expenses are shown separately and not counted.
+
+The export is recorded in the audit log.
+
 ## Checking the other parent's expenses
 
 Everything marked *Paid by: Other parent* (their Excel/CSV grid and the photos/PDFs they send) gets a **Check (other parent)** box, a summary at the top of "Your receipts", and the *Other parent: to check* filter.
 
+- **Workbooks with several tabs and a tab of photos**: when you add their .xlsx, every tab is read, and the receipt photos pasted into it become files of their own (fingerprinted, read by Claude and checked like any other photo), named after the tab and the number written on each photo (`n° 14`, `n° 2@7`). A tab with a single unnumbered picture beside a table (a prorata calculation, a list of fees) is not treated as a receipt tab: its picture stays in the spreadsheet, which is kept untouched. Side calculations and reference tables next to the list are not imported as expenses.
+- **Matched by invoice number**: Claude reads the grid's invoice-number column (`# facture`…). A row is linked to the photo carrying the same number in the same workbook, before any amount-based guess. `27-76-77` links a row to three photos and `2@7` one photo to rows 2 to 7; those groups are checked on their totals.
 - **Grid ↔ receipts**: each declared line is matched to one of their photos/PDFs (same amount within 7 days, or same store/description with another amount). A receipt can back up only one line. You can pick the supporting receipt yourself from the menu. The summary shows declared / backed by a receipt / amount higher than the receipt (excess) / no receipt.
 - **Flags on declared lines**: no receipt, declared amount ≠ receipt, receipt that also holds non-kids items, dates far apart, the same amount declared twice, the same receipt used for two lines, an expense that matches one of *your* receipts (you paid it), a date in the future, a supporting receipt that is itself suspicious.
 - **Their own (adult) expenses passed off as the children's**: lines Claude judged clearly for an adult (alcohol, tobacco, adult clothing…) or that you tagged *Not kids* are flagged, on a grid line itself or on the receipt behind it when the full amount is declared. The summary shows the adult amount to remove.

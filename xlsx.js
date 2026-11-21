@@ -181,3 +181,110 @@ export function sheetsToText(sheets, maxRows = 1500) {
   }
   return lines.join("\n");
 }
+
+/** Resolves a relationship target ("../media/image1.jpeg") against the part that holds it. */
+function resolvePart(from, target) {
+  if (target.startsWith("/")) return target.slice(1);
+  const parts = from.split("/").slice(0, -1);
+  for (const seg of target.split("/")) {
+    if (seg === "..") parts.pop();
+    else if (seg && seg !== ".") parts.push(seg);
+  }
+  return parts.join("/");
+}
+const relsPath = (part) => part.replace(/([^/]+)$/, "_rels/$1.rels");
+const MEDIA_TYPES = { jpeg: "image/jpeg", jpg: "image/jpeg", png: "image/png", gif: "image/gif", webp: "image/webp", heic: "image/heic" };
+
+/**
+ * Pictures placed on the sheets of an .xlsx (e.g. a tab of receipt photos), with the text of the
+ * text boxes laid over each one (people often number their receipts that way: "14", "2@7").
+ * Returns [{sheet, pictures: [{name, type, blob, labels: string[]}]}] in reading order, one entry per
+ * sheet that has pictures. Charts, icons and non-raster images are skipped.
+ */
+export async function readXlsxPictures(blob) {
+  const zip = await readZip(blob);
+  const xml = async (name) => {
+    const s = await zip.text(name);
+    return s ? new DOMParser().parseFromString(s, "application/xml") : null;
+  };
+  const relMap = async (part) => new Map(all(await xml(relsPath(part)), "Relationship")
+    .map((r) => [r.getAttribute("Id"), resolvePart(part, r.getAttribute("Target") || "")]));
+  const wb = await xml("xl/workbook.xml");
+  if (!wb) return [];
+  const wbRels = await relMap("xl/workbook.xml");
+  const out = [];
+  for (const sh of all(wb, "sheet")) {
+    const sheetPart = wbRels.get(sh.getAttributeNS(REL_NS, "id") || sh.getAttribute("r:id"));
+    if (!sheetPart) continue;
+    const sheetRels = await relMap(sheetPart);
+    const pics = [];
+    const labels = [];
+    for (const drawingPart of [...sheetRels.values()].filter((p) => /drawings\/[^/]+\.xml$/.test(p))) {
+      const doc = await xml(drawingPart);
+      if (!doc) continue;
+      const media = await relMap(drawingPart);
+      const cell = (anchor, tag) => {
+        const n = all(anchor, tag)[0];
+        if (!n) return null;
+        const num = (k) => Number(all(n, k)[0]?.textContent || 0);
+        return { col: num("col"), row: num("row") };
+      };
+      for (const anchor of [...all(doc, "twoCellAnchor"), ...all(doc, "oneCellAnchor")]) {
+        const from = cell(anchor, "from");
+        if (!from) continue;
+        const to = cell(anchor, "to") || { col: from.col + 4, row: from.row + 20 };
+        const box = { c0: from.col, r0: from.row, c1: Math.max(to.col, from.col), r1: Math.max(to.row, from.row) };
+        for (const pic of all(anchor, "pic")) {
+          const blip = all(pic, "blip")[0];
+          const path = media.get(blip?.getAttributeNS(REL_NS, "embed") || blip?.getAttribute("r:embed"));
+          const ext = (path?.match(/\.([a-z0-9]+)$/i) || [])[1]?.toLowerCase();
+          if (!path || !MEDIA_TYPES[ext]) continue;
+          const descr = all(pic, "cNvPr")[0]?.getAttribute("descr") || "";
+          pics.push({ ...box, path, type: MEDIA_TYPES[ext], descr, labels: [] });
+        }
+        for (const sp of all(anchor, "sp")) {
+          const text = all(sp, "t").map((x) => x.textContent).join("").trim();
+          if (text) labels.push({ col: from.col, row: from.row, text });
+        }
+      }
+    }
+    if (!pics.length) continue;
+    // A label belongs to the smallest picture it sits on, otherwise to the nearest one.
+    for (const l of labels) {
+      const on = pics.filter((p) => l.col >= p.c0 && l.col <= p.c1 && l.row >= p.r0 && l.row <= p.r1)
+        .sort((a, b) => (a.c1 - a.c0) * (a.r1 - a.r0) - (b.c1 - b.c0) * (b.r1 - b.r0));
+      const dist = (p) => Math.hypot(Math.max(p.c0 - l.col, 0, l.col - p.c1), Math.max(p.r0 - l.row, 0, l.row - p.r1) / 4);
+      const near = on[0] || pics.slice().sort((a, b) => dist(a) - dist(b)).find((p) => dist(p) <= 3);
+      near?.labels.push(l.text);
+    }
+    const seen = new Set();
+    const pictures = [];
+    for (const p of pics.sort((a, b) => a.r0 - b.r0 || a.c0 - b.c0)) {
+      if (seen.has(p.path)) continue; // the same image placed twice
+      seen.add(p.path);
+      const data = await zip.blob(p.path, p.type);
+      if (!data?.size) continue;
+      pictures.push({ name: p.descr || p.path.split("/").pop(), type: p.type, blob: data, labels: p.labels });
+    }
+    out.push({ sheet: sh.getAttribute("name") || "Sheet", pictures });
+  }
+  return out;
+}
+
+/**
+ * Invoice numbers in a reference such as "14", "27-76-77", "2@7" (2 to 7), "8 à 11", "n/a".
+ * Returns a Set of numbers as strings (empty when there is none).
+ */
+export function refNumbers(ref) {
+  const out = new Set();
+  const s = String(ref ?? "");
+  const re = /(\d+)\s*(?:@|à|\.\.|\bto\b|\bau\b)\s*(\d+)|\d+/gi;
+  for (let m; (m = re.exec(s));) {
+    if (m[2]) {
+      const a = Number(m[1]), b = Number(m[2]);
+      if (b >= a && b - a <= 60) for (let i = a; i <= b; i++) out.add(String(i));
+      else { out.add(String(a)); out.add(String(b)); }
+    } else out.add(String(Number(m[0])));
+  }
+  return out;
+}

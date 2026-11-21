@@ -122,6 +122,7 @@
         <button id="emailBtn" class="btn" data-i18n="btn.emailPlain">Email (summary only)</button>
         <button id="pdfBtn" class="btn" data-i18n="btn.pdf">Download PDF</button>
         <button id="csvBtn" class="btn" data-i18n="btn.csv">Download Excel (.xlsx)</button>
+        <button id="exXlsxBtn" class="btn" data-i18n="btn.exXlsx">Excel for the other parent</button>
         <button id="packShareBtn" class="btn" data-i18n="btn.share">Share evidence pack (.zip)</button>
         <button id="zipBtn" class="btn" data-i18n="btn.zip">Download evidence pack (.zip)</button>
         <button id="richCopyBtn" class="btn" data-i18n="btn.richCopy">Copy coloured summary</button>
@@ -166,6 +167,10 @@
       <label class="field">
         <span data-i18n="set.split"></span>
         <input id="splitDefault" type="number" min="0" max="100" step="1" placeholder="50">
+      </label>
+      <label class="field">
+        <span data-i18n="set.parentShare"></span>
+        <input id="parentShare" type="number" min="0" max="100" step="any" inputmode="decimal" placeholder="50">
       </label>
       <label class="field">
         <span data-i18n="set.recipient">Default recipient</span>

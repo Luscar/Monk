@@ -1,7 +1,7 @@
 import Anthropic from "./vendor/anthropic-sdk.js";
 import { db } from "./db.js";
 import { makeZip, readZip } from "./zip.js";
-import { makeXlsx, readXlsx, readCsv, sheetsToText } from "./xlsx.js";
+import { makeXlsx, readXlsx, readXlsxPictures, refNumbers, readCsv, sheetsToText } from "./xlsx.js";
 import { t, lang, locale, regionCurrency, actionLabel, applyStatic } from "./i18n.js";
 import { readExif, dHash, hamming, EDITOR_RE } from "./imgcheck.js";
 
@@ -38,6 +38,12 @@ const settings = {
     const n = Number(raw);
     return raw !== "" && Number.isFinite(n) && n >= 0 && n <= 100 ? n : 50;
   },
+  /** My share (%) of the children's expenses, for the account between the parents. */
+  get parentShare() {
+    const raw = store.get("parentShare").trim().replace(",", ".");
+    const n = Number(raw);
+    return raw !== "" && Number.isFinite(n) && n >= 0 && n <= 100 ? n : 50;
+  },
 };
 
 // Models that support server-side refusal fallbacks ("default" routing).
@@ -68,11 +74,12 @@ const RECEIPT_SCHEMA = {
         required: [
           "store_name", "store_address", "date", "time", "currency",
           "receipt_number", "payment_method", "items",
-          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type", "source_ref", "authenticity_concerns",
+          "subtotal", "discount", "tax", "tip", "total", "notes", "document_type", "source_ref", "invoice_ref", "authenticity_concerns",
         ],
         properties: {
           store_name: { type: "string" },
           source_ref: { ...nullable("string"), description: "Spreadsheets only: sheet and row(s), e.g. 'Feuil1 L12'. null for photos/PDFs" },
+          invoice_ref: { ...nullable("string"), description: "Spreadsheets only: the row's receipt/invoice number column (e.g. '# facture', 'No pièce'), exactly as written, e.g. '14', '27-76-77', '2@7'. null if none or for photos/PDFs" },
           store_address: nullable("string"),
           date: { ...nullable("string"), description: "ISO date YYYY-MM-DD" },
           time: { ...nullable("string"), description: "24h HH:MM" },
@@ -129,7 +136,7 @@ Rules:
 - document_type: "receipt" if it shows a completed payment (e.g. paid, card approved, change given); "invoice" for a bill, amount due, quote or statement without proof of payment; otherwise "other".
 - likely_for_children is only a suggestion the user will confirm: "yes" for things clearly for a child (kids' clothing or shoe sizes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" for things clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items such as general groceries, cleaning products, or fuel.
 - expense_type is also only a suggestion: for items that are (or may be) for the children, pick the type from the user's list whose examples fit best; use "unknown" when unsure or when the item is not for the children.
-- Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12"). Skip headers, totals, subtotals and empty rows. Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
+- Spreadsheets: each row that records an expense becomes one entry in receipts (one item unless the row clearly lists several), with source_ref set to the sheet and row (e.g. "Feuil1 L12") and invoice_ref set to the row's receipt/invoice number column if there is one (e.g. "# facture"; keep it as written, null for "n/a", "manquante" or blank). Skip headers, totals, subtotals, empty rows, and side calculations or reference tables placed beside the list (prorata tables, income tables, working columns). Use the row's own date, description and amount; store_name is the merchant if a column gives it, otherwise a short description. document_type is "other". Amounts in the sheet may use a comma as decimal separator.
 - authenticity_concerns: null in the normal case. Only for photos/PDFs, and only when you see concrete signs that the document may have been altered or is not genuine: digits in a different font, size or alignment than the rest, amounts or dates that look overwritten or retouched, a total that matches no printed lines, a date inconsistent with other printed dates, a digitally composed receipt. Then ONE short factual sentence saying where. Never speculate; null for spreadsheets.
 - If the file contains no receipt at all, return an empty receipts array.`;
 
@@ -280,7 +287,9 @@ async function sha256Hex(blob) {
 }
 
 async function addFiles(fileList, { role = "receipt" } = {}) {
+  let embeddedDupes = 0;
   for (const file of [...fileList]) {
+    const embedded = file.embeddedFrom; // a photo taken out of a spreadsheet (see addSheetPictures)
     const kind = isPdf(file) ? "pdf" : isSheet(file) ? "sheet"
       : file.type.startsWith("image/") || /\.(heic|heif)$/i.test(file.name) ? "image" : null;
     if (/\.(xls|numbers|ods)$/i.test(file.name)) { toast(t("t.oldSheet", { name: file.name }), 6000); continue; }
@@ -289,6 +298,7 @@ async function addFiles(fileList, { role = "receipt" } = {}) {
 
     const sha256 = await sha256Hex(file);
     const existing = files.find((f) => f.sha256 === sha256);
+    if (existing && embedded) { embeddedDupes += 1; continue; }
     if (existing) {
       const ids = existing.receiptIds?.length ? ` (${existing.receiptIds.join(", ")})` : "";
       toast(t("t.already", { name: existing.name, ids }), 4000);
@@ -310,14 +320,50 @@ async function addFiles(fileList, { role = "receipt" } = {}) {
       role,
       sensitive: false, // the 🔒 button on the file in the queue marks it sensitive before extraction
     };
+    if (embedded) Object.assign(rec, { parentId: embedded.parent.id, payer: embedded.parent.payer, sheet: embedded.sheet, invoiceRef: embedded.ref || null });
     if (rec.sensitive) rec.status = "manual";
     if (kind === "image" && role !== "statement") rec.img = await imageInfo(file);
     files.push(rec);
     await saveFile(rec);
     await log("file_added", "", t("lg.fileAdded", { name: rec.name, size: rec.size, sha: sha256 })
-      + (rec.sensitive ? ` · ${t("lg.sensitiveTag")}` : ""));
+      + (rec.sensitive ? ` · ${t("lg.sensitiveTag")}` : "")
+      + (embedded ? ` · ${t("lg.embedded", { name: embedded.parent.name, sheet: embedded.sheet, ref: embedded.ref || "—" })}` : ""));
+    if (kind === "sheet" && /\.xlsx$/i.test(rec.name) && role !== "statement") await addSheetPictures(rec);
   }
+  if (embeddedDupes) toast(t("t.embeddedDupes", { n: embeddedDupes }), 4000);
   render();
+}
+
+/**
+ * Receipt photos pasted into a spreadsheet (often a tab of their own, each photo numbered with a text box)
+ * become files of their own, so they are read, fingerprinted and checked like any other photo, and matched
+ * to the grid rows by their number. Pictures on tabs that don't look like a receipt tab (a single unnumbered
+ * image next to a table, e.g. a prorata calculation) are left in the spreadsheet.
+ */
+async function addSheetPictures(sheetFile) {
+  let groups;
+  try { groups = await readXlsxPictures(sheetFile.blob); } catch (err) { console.warn("xlsx pictures", err); return; }
+  const keep = groups.filter((g) => g.pictures.length >= 3 || g.pictures.some((p) => p.labels.length));
+  const skipped = groups.filter((g) => !keep.includes(g));
+  const base = sheetFile.name.replace(/\.xlsx$/i, "");
+  const list = [];
+  for (const g of keep) {
+    g.pictures.forEach((p, i) => {
+      const ref = p.labels.join(", ");
+      const ext = p.type === "image/png" ? ".png" : p.type === "image/gif" ? ".gif" : p.type === "image/webp" ? ".webp" : ".jpg";
+      const name = `${base} · ${g.sheet} · ${ref ? `n° ${ref}` : `#${i + 1}`}${ext}`;
+      const f = new File([p.blob], name.replace(/[\\/:*?"<>|]/g, "-"), { type: p.type, lastModified: sheetFile.blob.lastModified || Date.now() });
+      f.embeddedFrom = { parent: sheetFile, sheet: g.sheet, ref };
+      list.push(f);
+    });
+  }
+  if (list.length) {
+    toast(t("t.embedded", { n: list.length, sheets: keep.map((g) => g.sheet).join(", ") }), 5000);
+    await addFiles(list);
+  }
+  if (skipped.length) {
+    await log("file_added", "", t("lg.embeddedSkipped", { name: sheetFile.name, sheets: skipped.map((g) => `${g.sheet} (${g.pictures.length})`).join(", ") }));
+  }
 }
 
 /** EXIF + picture hash, computed on the device, used to check the other parent's photos. */
@@ -496,6 +542,7 @@ async function createReceipts(file, extracted) {
       model: settings.model,
       payer: file.payer || "me",
       declared: file.kind === "sheet",
+      invoice_ref: file.kind === "sheet" ? x.invoice_ref || null : file.invoiceRef || null,
       items: (x.items || []).map((it) => {
         const alloc = settings.autoTag ? SUGGESTION_TO_ALLOC[it.likely_for_children] || "review" : "review";
         return {
@@ -729,6 +776,26 @@ function verifyOther() {
     const p = d.justifiedBy && getReceipt(d.justifiedBy);
     if (p && !p.voided) { res.get(d.id).match = p.id; used.set(p.id, d.id); }
   }
+  // Then by invoice number: a grid row "# facture 14" ↔ the photo numbered 14 in the same workbook.
+  // One row can rest on several photos ("27-76-77") and one photo on several rows ("2@7").
+  const proofRefs = new Map(proofs.map((p) => [p.id, refNumbers(p.invoice_ref)]));
+  for (const d of declared) {
+    if (res.get(d.id).match) continue;
+    const want = refNumbers(d.invoice_ref);
+    if (!want.size) continue;
+    const hits = proofs.filter((p) => fileOf(p)?.parentId === d.fileId && [...proofRefs.get(p.id)].some((n) => want.has(n)));
+    if (!hits.length) continue;
+    Object.assign(res.get(d.id), { match: hits[0].id, matches: hits.map((p) => p.id), byRef: true });
+    for (const p of hits) if (!used.has(p.id)) used.set(p.id, d.id);
+  }
+  // Rows that rest on the same set of photos are checked together against those photos.
+  const refGroups = new Map();
+  for (const d of declared) {
+    const v = res.get(d.id);
+    if (!v.byRef) continue;
+    const key = v.matches.slice().sort().join("+");
+    refGroups.set(key, [...(refGroups.get(key) || []), d]);
+  }
   const pairs = [];
   for (const d of declared) {
     if (res.get(d.id).match) continue;
@@ -762,7 +829,23 @@ function verifyOther() {
       v.adult = own.amount;
     }
     if (!p) add(d, "warn", "noProof");
-    else {
+    else if (v.byRef && (v.matches.length > 1 || refGroups.get(v.matches.slice().sort().join("+")).length > 1)) {
+      // Several photos for this row, or one photo for several rows: compare the totals of the group.
+      const rows = refGroups.get(v.matches.slice().sort().join("+"));
+      const ps = v.matches.map(getReceipt);
+      const rowsSum = round2(rows.reduce((sum, x) => sum + receiptTotal(x), 0));
+      const pSum = round2(ps.reduce((sum, x) => sum + receiptTotal(x), 0));
+      const pKids = ps.every(isTagged) ? round2(ps.reduce((sum, x) => sum + allocation(x).kids, 0)) : null;
+      const pIds = ps.map((x) => x.id).join(" + ");
+      if (!sameMoney(rowsSum, pSum) && !(pKids != null && sameMoney(rowsSum, pKids))) {
+        add(d, rowsSum > pSum ? "bad" : "warn", rows.length > 1 ? "groupDiff" : "amountDiff",
+          { a: fmtMoney(rows.length > 1 ? rowsSum : amount, c), b: fmtMoney(pSum, c), id: pIds, d: fmtMoney(rowsSum - pSum, c), ids: ids(rows) });
+        v.diff = rowsSum ? round2((amount / rowsSum) * (rowsSum - pSum)) : 0;
+      } else if (pKids != null && rowsSum > pKids + 0.01) {
+        add(d, "bad", "inclNotKids", { k: fmtMoney(pKids, c), id: pIds });
+        v.adult = round2((amount / rowsSum) * (rowsSum - pKids));
+      }
+    } else {
       const pt = receiptTotal(p);
       const kids = isTagged(p) ? allocation(p).kids : null;
       if (!sameMoney(amount, pt) && !(kids != null && sameMoney(amount, kids))) {
@@ -782,7 +865,7 @@ function verifyOther() {
       && ((d.date && x.date === d.date) || (daysApart(x.date, d.date) <= 3 && similar(x, d))));
     if (twice.length) add(d, "bad", "twice", { ids: ids(twice) });
     if (p) {
-      const shared = declared.filter((x) => x.id !== d.id && x.justifiedBy === p.id);
+      const shared = declared.filter((x) => x.id !== d.id && x.justifiedBy === p.id && !(v.byRef && res.get(x.id).byRef));
       if (shared.length) add(d, "bad", "proofShared", { id: p.id, ids: ids(shared) });
     }
     const paidByMe = mine.filter((x) => curOf(x) === c && sameMoney(receiptTotal(x), amount) && daysApart(x.date, d.date) <= 3);
@@ -865,18 +948,20 @@ function verifySummary(list, ver = verifyOther()) {
     if (v.adult > 0) { x.adult += v.adult; x.nAdult += 1; }
     const p = v.match && getReceipt(v.match);
     if (!p) { x.noProof += amt; x.nNoProof += 1; continue; }
-    const diff = v.issues.find((i) => i.key === "amountDiff");
-    if (diff) { x.diff += amt - receiptTotal(p); x.nDiff += 1; } else { x.backed += amt; x.nBacked += 1; }
+    const diff = v.issues.find((i) => i.key === "amountDiff" || i.key === "groupDiff");
+    if (diff) { x.diff += v.diff ?? amt - receiptTotal(p); x.nDiff += 1; } else { x.backed += amt; x.nBacked += 1; }
   }
   return Object.values(by).map((x) => Object.fromEntries(Object.entries(x).map(([k, v]) => [k, typeof v === "number" && !k.startsWith("n") ? round2(v) : v])));
 }
+
+const matchHow = (r, v) => (v.byRef ? t("vf.byRef", { n: r.invoice_ref }) : v.auto ? t("vf.auto") : t("vf.manualLink"));
 
 /** One line per entry for the report / Excel: status and the problems found. */
 function verifyText(r, v) {
   if (!v) return "";
   const p = v.kind === "declared" && v.match && getReceipt(v.match);
   const head = v.kind === "declared"
-    ? (p ? t("vf.backedBy", { id: p.id, m: v.auto ? t("vf.auto") : t("vf.manualLink") }) : t("vf.noProofShort"))
+    ? (p ? t("vf.backedBy", { id: (v.matches || [p.id]).join(" + "), m: matchHow(r, v) }) : t("vf.noProofShort"))
     : t("vf.proofShort");
   const probs = v.issues.filter((i) => i.level !== "info").map(issueText);
   const dec = r.check?.decision === "accepted" ? t("vf.acceptedShort")
@@ -1604,6 +1689,66 @@ function buildXlsx(list = reportReceipts()) {
     { name: t("xl.sheetReceipts"), rows: receiptRows(list), money: [7, 8, 9, 10, 11, 12, 13, 14], widths: { 24: 20, 27: 60 } },
     { name: t("xl.sheetItems"), rows: itemRows(list), money: [9, 10, 14, 17, 18], widths: { 28: 20 } },
   ]);
+}
+
+/**
+ * Excel for the other parent: only what concerns them. One row per children's line (kids or split)
+ * of each non-voided receipt in the period, plus a summary with the account between the parents.
+ * Leaves out adult lines, untagged lines, fingerprints, Claude's suggestions, private notes and flags.
+ */
+function buildExXlsx(list = reportReceipts()) {
+  const ver = verifyOther();
+  const lines = [t("ex.linesHdr")];
+  const sums = {};
+  const myPct = settings.parentShare;
+  for (const r of list) {
+    if (r.voided) continue;
+    const a = allocation(r);
+    const kidsItems = a.items.filter(isKidsLine);
+    if (!kidsItems.length) continue;
+    const c = curOf(r);
+    const disputed = r.payer === "other" && r.check?.decision === "disputed";
+    const status = disputed ? t("vf.disputedShort", { r: r.check.reason || "" })
+      : r.payer === "other" && r.check?.decision === "accepted" ? t("vf.acceptedShort") : "";
+    for (const it of kidsItems) {
+      const amt = itemKidsAmount(it, a.factor);
+      lines.push([
+        r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description || ""}`, it.exp_type || "",
+        it.line_total, it.alloc === "split" ? (it.split_pct ?? 50) : 100, amt, c, status,
+      ]);
+      const s = (sums[c] ??= { me: 0, other: 0, disputed: 0 });
+      if (disputed) s.disputed += amt;
+      else s[r.payer === "other" ? "other" : "me"] += amt;
+    }
+  }
+  const summary = [t("ex.sumHdr"), [t("ex.period"), periodLabel()], [t("ex.myShare"), `${myPct} %`], [t("ex.otherShare"), `${100 - myPct} %`], []];
+  for (const [c, s] of Object.entries(sums).sort()) {
+    const total = round2(s.me + s.other);
+    const myDue = round2(total * myPct / 100);
+    const balance = round2(s.me - myDue); // > 0: the other parent owes me
+    summary.push(
+      [t("ex.currency"), c],
+      [t("ex.paidMe"), round2(s.me)],
+      [t("ex.paidOther"), round2(s.other)],
+      [t("ex.total"), total],
+      [t("ex.dueMe", { p: myPct }), myDue],
+      [t("ex.dueOther", { p: 100 - myPct }), round2(total - myDue)],
+      [balance >= 0 ? t("ex.otherOwes") : t("ex.iOwe"), Math.abs(balance)],
+    );
+    if (s.disputed) summary.push([t("ex.disputed"), round2(s.disputed)]);
+    summary.push([]);
+  }
+  if (!Object.keys(sums).length) summary.push([t("ex.none")]);
+  summary.push([t("ex.note")]);
+  return makeXlsx([
+    { name: t("ex.sheetSummary"), rows: summary, money: [1], widths: { 0: 44, 1: 28 } },
+    { name: t("ex.sheetLines"), rows: lines, money: [6, 8], widths: { 4: 40, 10: 30 } },
+  ]);
+}
+
+async function exXlsxFile(list) {
+  const blob = await buildExXlsx(list);
+  return new File([blob], `${t("ex.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type });
 }
 
 function buildLogCsv() {
@@ -2510,8 +2655,9 @@ function renderCheckBlock(r, v, ver) {
   const c = curOf(r);
   const p = v.kind === "declared" && v.match && getReceipt(v.match);
   const head = v.kind === "declared"
-    ? (p ? h("div", { class: "vf-head ok" }, t("vf.backedBy", { id: p.id, m: v.auto ? t("vf.auto") : t("vf.manualLink") }),
-      h("span", { class: "meta" }, ` — ${p.store_name || ""} ${p.date || ""} ${fmtMoney(receiptTotal(p), curOf(p))}`))
+    ? (p ? h("div", { class: "vf-head ok" }, t("vf.backedBy", { id: (v.matches || [p.id]).join(" + "), m: matchHow(r, v) }),
+      h("span", { class: "meta" }, ` — ${(v.matches || [p.id]).map(getReceipt)
+        .map((x) => `${x.store_name || ""} ${x.date || ""} ${fmtMoney(receiptTotal(x), curOf(x))}`.trim()).join(" · ")}`))
       : h("div", { class: "vf-head warn" }, t("vf.noProofShort")))
     : (v.match ? h("div", { class: "vf-head ok" }, t("vf.supports", { id: v.match })) : h("div", { class: "vf-head" }, t("vf.proofShort")));
   const issues = v.issues.map((i) => h("li", { class: i.level }, issueText(i)));
@@ -2645,6 +2791,7 @@ function openSettings() {
   $("#defaultCurrency").value = store.get("defaultCurrency");
   $("#kidsContext").value = settings.kidsContext;
   $("#splitDefault").value = store.get("splitDefault");
+  $("#parentShare").value = store.get("parentShare");
   $("#autoTag").checked = settings.autoTag;
   $("#expTypes").value = store.get("expTypes") || t("types.default");
   $("#langSelect").value = store.get("lang") || "auto";
@@ -2660,6 +2807,7 @@ $("#settingsDialog").addEventListener("close", () => {
   store.set("defaultCurrency", $("#defaultCurrency").value.trim().toUpperCase());
   store.set("kidsContext", $("#kidsContext").value.trim());
   store.set("splitDefault", $("#splitDefault").value.trim());
+  store.set("parentShare", $("#parentShare").value.trim());
   store.set("autoTag", $("#autoTag").checked ? "1" : "");
   const typesText = $("#expTypes").value.trim();
   store.set("expTypes", typesText === t("types.default") ? "" : typesText);
@@ -2767,6 +2915,14 @@ $("#zipBtn").addEventListener("click", async () => {
 $("#csvBtn").addEventListener("click", async () => {
   const blob = await buildXlsx();
   download(new File([blob], `${t("pk.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
+});
+$("#exXlsxBtn").addEventListener("click", async () => {
+  try {
+    const list = reportReceipts();
+    await shareOrDownload(await exXlsxFile(list), t("ex.shareTitle"));
+    await log("ex_exported", "", t("lg.exExport", { p: periodLabel(), pct: settings.parentShare }));
+    render();
+  } catch (err) { console.error(err); toast(t("t.packFail")); }
 });
 $("#richCopyBtn").addEventListener("click", copyRichSummary);
 $("#copyBtn").addEventListener("click", async () => {
