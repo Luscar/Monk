@@ -109,15 +109,15 @@
         <span data-i18n="set.kids"></span>
         <textarea id="kidsContext" rows="2"></textarea>
       </label>
-      <div class="two-col">
-        <label class="field">
-          <span data-i18n="set.share"></span>
-          <input id="parentShare" type="number" min="0" max="100" step="any" inputmode="decimal" placeholder="50">
-        </label>
-        <label class="field">
-          <span data-i18n="set.currency"></span>
-          <input id="defaultCurrency" type="text" maxlength="3">
-        </label>
+      <label class="field">
+        <span data-i18n="set.currency"></span>
+        <input id="defaultCurrency" type="text" maxlength="3">
+      </label>
+      <div class="field">
+        <span data-i18n="set.shares"></span>
+        <p class="hint" data-i18n="set.sharesHint"></p>
+        <div id="shareRows" class="share-rows"></div>
+        <div><button type="button" id="addShareYear" class="btn small" data-i18n="set.addYear"></button></div>
       </div>
       <div class="row">
         <button value="save" class="btn primary" data-i18n="set.save"></button>

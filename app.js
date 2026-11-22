@@ -28,9 +28,30 @@ const settings = {
   get currency() { return (store.get("defaultCurrency") || regionCurrency()).toUpperCase(); },
   get kidsContext() { return store.get("kidsContext").trim(); },
   get intakePayer() { return store.get("intakePayer") === "other" ? "other" : "me"; },
-  /** My share (%) of the kids' expenses. */
-  get parentShare() { return pct(store.get("parentShare"), 50); },
+  /** My share (%) of the "Particulière" expenses, by year: {"2025": 62, "2026": 58}. */
+  get specialShares() {
+    try {
+      const o = JSON.parse(store.get("specialShares", "{}"));
+      return o && typeof o === "object" && !Array.isArray(o) ? o : {};
+    } catch { return {}; }
+  },
 };
+
+/** "Base" lines are always split 50/50. */
+const BASE_SHARE = 50;
+
+/**
+ * My share of a "Particulière" line for a year. A year with no ratio set uses the
+ * closest earlier year (or the earliest one set); with none at all, 50 %.
+ */
+function specialShare(year) {
+  const map = settings.specialShares;
+  const years = Object.keys(map).filter((y) => /^\d{4}$/.test(y)).map(Number).sort((a, b) => a - b);
+  if (!years.length) return { p: BASE_SHARE, from: null };
+  const y = Number(year);
+  const from = years.includes(y) ? y : years.filter((x) => x < y).pop() ?? years[0];
+  return { p: pct(map[from], BASE_SHARE), from };
+}
 
 const FALLBACK_MODELS = new Set(["claude-opus-5-5", "claude-sonnet-5-5"]);
 const CONCURRENCY = 3;
@@ -96,7 +117,7 @@ Rules:
 // ---------------------------------------------------------------------------
 /** Original files: {id, name, type, kind, size, addedAt, sha256, blob, status, error, receiptIds, payer} */
 let files = [];
-/** Receipts: {id, fileId, source, sha256, payer, store_name, date, currency, tax, total, items[{description, line_total, ai_suggestion, alloc, split_pct}]} */
+/** Receipts: {id, fileId, source, sha256, payer, store_name, date, currency, tax, total, items[{description, line_total, ai_suggestion, alloc, split_pct, cat: "base"|"special"}]} */
 let receipts = [];
 let seq = 0;
 let processing = false;
@@ -331,6 +352,7 @@ async function createReceipts(file, extracted) {
         ai_suggestion: it.likely_for_children,
         alloc: SUGGESTION_TO_ALLOC[it.likely_for_children] || "review",
         split_pct: DEFAULT_SPLIT,
+        cat: "base",
       })),
     };
     receipts.push(r);
@@ -383,7 +405,7 @@ async function processAll() {
 function effectiveItems(r) {
   let prev = null;
   return (r.items || []).map((it) => {
-    if ((it.line_total || 0) < 0 && prev) return { ...it, alloc: prev.alloc, split_pct: prev.split_pct, linked: true };
+    if ((it.line_total || 0) < 0 && prev) return { ...it, alloc: prev.alloc, split_pct: prev.split_pct, cat: prev.cat, linked: true };
     if ((it.line_total || 0) >= 0) prev = it;
     return it;
   });
@@ -419,7 +441,13 @@ function inPeriod(r) {
   return (!from || r.date >= from) && (!to || r.date <= to);
 }
 
-/** Per currency: kids' expenses paid by each parent and who owes whom. */
+const isSpecial = (it) => it.cat === "special";
+const yearOf = (r) => (r.date || "").slice(0, 4) || String(new Date().getFullYear());
+
+/**
+ * Per currency: kids' expenses paid by each parent and who owes whom.
+ * "Base" lines are shared 50/50; "Particulière" lines by that year's ratio.
+ */
 function account(list) {
   const sums = {};
   let pending = 0;
@@ -427,16 +455,31 @@ function account(list) {
     const a = allocation(r);
     pending += a.pending;
     if (!a.kids) continue;
-    const s = (sums[curOf(r)] ??= { me: 0, other: 0 });
+    const s = (sums[curOf(r)] ??= { me: 0, other: 0, base: 0, special: {} });
     s[r.payer === "other" ? "other" : "me"] += a.kids;
+    for (const it of a.lines) {
+      if (!it.kids) continue;
+      if (isSpecial(it)) s.special[yearOf(r)] = (s.special[yearOf(r)] || 0) + it.kids;
+      else s.base += it.kids;
+    }
   }
-  const myPct = settings.parentShare;
   const rows = Object.entries(sums).sort().map(([c, s]) => {
     const total = round2(s.me + s.other);
-    const myDue = round2(total * myPct / 100);
-    return { c, me: round2(s.me), other: round2(s.other), total, myDue, otherDue: round2(total - myDue), balance: round2(s.me - myDue) };
+    const base = { amount: round2(s.base), p: BASE_SHARE, mine: round2(s.base * BASE_SHARE / 100) };
+    const special = Object.entries(s.special).sort().map(([year, amount]) => {
+      const { p, from } = specialShare(year);
+      return { year, amount: round2(amount), p, from, mine: round2(amount * p / 100) };
+    });
+    const myDue = round2(base.mine + special.reduce((n, x) => n + x.mine, 0));
+    return { c, me: round2(s.me), other: round2(s.other), total, base, special, myDue, otherDue: round2(total - myDue), balance: round2(s.me - myDue) };
   });
-  return { rows, pending, myPct };
+  return { rows, pending };
+}
+
+/** Label for a "Particulière" year, noting when another year's ratio is used. */
+function specialLabel(x) {
+  const ratio = x.from == null ? t("split.noRatio") : String(x.from) !== x.year ? t("split.ratioFrom", { y: x.from }) : "";
+  return `${t("split.special", { y: x.year, p: x.p })}${ratio ? ` — ${ratio}` : ""}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -444,6 +487,7 @@ function account(list) {
 // ---------------------------------------------------------------------------
 const NEXT_ALLOC = { review: "kids", kids: "split", split: "not", not: "review" };
 const ALLOC_LABEL = { kids: "tag.kids", split: "tag.split", not: "tag.not", review: "tag.review" };
+const CAT_LABEL = { base: "cat.base", special: "cat.special" };
 
 async function update(r, fn) {
   fn(r);
@@ -505,11 +549,12 @@ async function exportXlsx() {
   for (const r of list) {
     for (const it of allocation(r).lines) {
       if (!it.kids) continue;
+      const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
-        Math.round(kidsShare(it) * 100), it.kids, curOf(r)]);
+        Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r)]);
     }
   }
-  const { rows, myPct } = account(list);
+  const { rows } = account(list);
   const from = $("#periodFrom").value;
   const to = $("#periodTo").value;
   const summary = [[t("xl.period"), from || to ? `${from || "…"} → ${to || "…"}` : t("xl.all")], []];
@@ -519,15 +564,18 @@ async function exportXlsx() {
       [t("split.paidMe"), x.me],
       [t("split.paidOther"), x.other],
       [t("split.total"), x.total],
-      [t("split.shareMe", { p: myPct }), x.myDue],
-      [t("split.shareOther", { p: 100 - myPct }), x.otherDue],
+      [t("split.base", { p: x.base.p }), x.base.amount],
+      [t("split.mineOf"), x.base.mine],
+      ...x.special.flatMap((s) => [[specialLabel(s), s.amount], [t("split.mineOf"), s.mine]]),
+      [t("split.shareMe"), x.myDue],
+      [t("split.shareOther"), x.otherDue],
       [x.balance >= 0 ? t("split.otherOwes") : t("split.iOwe"), Math.abs(x.balance)],
       [],
     );
   }
   const blob = await makeXlsx([
     { name: t("xl.account"), rows: summary, money: [1], widths: { 0: 44, 1: 20 } },
-    { name: t("xl.lines"), rows: lines, money: [5, 7], widths: { 4: 40 } },
+    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14 } },
   ]);
   await shareOrDownload(new File([blob], `${t("xl.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
 }
@@ -641,7 +689,12 @@ function renderReceipt(r) {
         h("input", {
           class: "pct", type: "number", min: 0, max: 100, step: 1, value: it.split_pct ?? DEFAULT_SPLIT,
           onchange: (e) => update(r, () => { r.items[idx].split_pct = pct(e.target.value, DEFAULT_SPLIT); }),
-        }), "%")),
+        }), "%"),
+      kidsShare(it) > 0 && !it.linked && h("div", {}, h("button", {
+        class: `tag cat ${isSpecial(it) ? "special" : "base"}`,
+        title: isSpecial(it) ? t("cat.specialHint", { p: specialShare(yearOf(r)).p }) : t("cat.baseHint"),
+        onclick: () => update(r, () => { r.items[idx].cat = isSpecial(it) ? "base" : "special"; }),
+      }, t(CAT_LABEL[isSpecial(it) ? "special" : "base"])))),
     h("td", { class: "desc" }, it.description),
     h("td", { class: "num" }, h("button", { class: "amount-btn", onclick: () => editAmount(r, idx) }, fmtNum(it.line_total)))));
 
@@ -670,19 +723,22 @@ function renderReceipt(r) {
 }
 
 function renderAccount() {
-  const { rows, pending, myPct } = account(shownReceipts().filter(inPeriod));
+  const { rows, pending } = account(shownReceipts().filter(inPeriod));
   const line = (label, value, cls = "") => h("div", { class: `acct-row ${cls}` }, h("span", {}, label), h("b", {}, value));
   $("#account").replaceChildren(
     ...(rows.length ? rows.map((x) => h("div", { class: "acct" },
       line(t("split.paidMe"), fmtMoney(x.me, x.c)),
       line(t("split.paidOther"), fmtMoney(x.other, x.c)),
       line(t("split.total"), fmtMoney(x.total, x.c)),
-      line(t("split.shareMe", { p: myPct }), fmtMoney(x.myDue, x.c), "sub"),
-      line(t("split.shareOther", { p: 100 - myPct }), fmtMoney(x.otherDue, x.c), "sub"),
+      x.base.amount ? line(t("split.base", { p: x.base.p }), `${fmtMoney(x.base.amount, x.c)} → ${fmtMoney(x.base.mine, x.c)}`, "sub") : null,
+      ...x.special.map((s) => line(specialLabel(s), `${fmtMoney(s.amount, x.c)} → ${fmtMoney(s.mine, x.c)}`, "sub")),
+      line(t("split.shareMe"), fmtMoney(x.myDue, x.c)),
+      line(t("split.shareOther"), fmtMoney(x.otherDue, x.c)),
       Math.abs(x.balance) < 0.005
         ? line(t("split.even"), "", "result")
         : line(x.balance > 0 ? t("split.otherOwes") : t("split.iOwe"), fmtMoney(Math.abs(x.balance), x.c), "result")))
       : [h("p", { class: "hint" }, t("split.none"))]),
+    ...(rows.length ? [h("p", { class: "hint" }, t("split.legend"))] : []),
     ...(pending ? [h("p", { class: "hint warn-text" }, t("split.pending", { n: pending }))] : []),
   );
 }
@@ -694,7 +750,7 @@ function openSettings() {
   $("#apiKey").value = settings.apiKey;
   $("#model").value = settings.model;
   $("#kidsContext").value = settings.kidsContext;
-  $("#parentShare").value = store.get("parentShare");
+  renderShareRows(settings.specialShares);
   $("#defaultCurrency").value = store.get("defaultCurrency");
   $("#defaultCurrency").placeholder = regionCurrency();
   $("#langSelect").value = store.get("lang") || "auto";
@@ -706,12 +762,38 @@ $("#settingsDialog").addEventListener("close", () => {
   store.set("apiKey", $("#apiKey").value.trim());
   store.set("model", $("#model").value);
   store.set("kidsContext", $("#kidsContext").value.trim());
-  store.set("parentShare", $("#parentShare").value.trim());
+  const shares = {};
+  for (const row of $("#shareRows").children) {
+    const y = row.querySelector(".share-year").value.trim();
+    const p = String(row.querySelector(".share-pct").value).trim();
+    if (/^\d{4}$/.test(y) && p !== "") shares[y] = pct(p, BASE_SHARE);
+  }
+  store.set("specialShares", JSON.stringify(shares));
   store.set("defaultCurrency", $("#defaultCurrency").value.trim().toUpperCase());
   const newLang = $("#langSelect").value;
   if (newLang !== (store.get("lang") || "auto")) { store.set("lang", newLang); location.reload(); return; }
   toast(t("t.saved"));
   render();
+});
+
+function shareRow(year = "", p = "") {
+  return h("div", { class: "share-row" },
+    h("input", { class: "share-year", type: "number", min: 2000, max: 2100, step: 1, inputmode: "numeric", value: year, "aria-label": t("set.year"), placeholder: t("set.year") }),
+    h("input", { class: "share-pct", type: "number", min: 0, max: 100, step: "any", inputmode: "decimal", value: p, "aria-label": t("set.pct"), placeholder: "%" }),
+    h("span", {}, "%"),
+    h("button", { type: "button", class: "btn small ghost", "aria-label": t("set.removeYear"), onclick: (e) => e.currentTarget.parentElement.remove() }, "✕"));
+}
+
+function renderShareRows(map) {
+  const years = Object.keys(map).sort();
+  $("#shareRows").replaceChildren(...years.map((y) => shareRow(y, map[y])));
+}
+
+$("#addShareYear").addEventListener("click", () => {
+  const years = [...$("#shareRows").querySelectorAll(".share-year")].map((i) => Number(i.value)).filter(Boolean);
+  const next = years.length ? Math.max(...years) + 1 : new Date().getFullYear();
+  const prev = $("#shareRows").lastElementChild?.querySelector(".share-pct").value ?? "";
+  $("#shareRows").append(shareRow(next, prev));
 });
 
 $("#wipeBtn").addEventListener("click", async () => {
