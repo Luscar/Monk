@@ -735,16 +735,46 @@ function renderInvoiceDialog(r) {
 // ---------------------------------------------------------------------------
 const payerLabel = (r) => t(r.payer === "other" ? "payer.other" : "payer.me");
 
-async function exportXlsx() {
+/** File-name-safe text that keeps accents (the ZIP stores UTF-8 names). */
+const docName = (s) => String(s).normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+const extOf = (f) => (f.name.match(/\.[a-z0-9]+$/i) || [""])[0].toLowerCase()
+  || { "application/pdf": ".pdf", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" }[f.type] || ".jpg";
+
+/** The proof of an entry: invoice pictures linked to an Excel line, else the photo/PDF it was read from. */
+function proofsOf(r) {
+  if (r.source_ref) return invoicesOf(r);
+  const f = files.find((x) => x.id === r.fileId);
+  return f?.blob ? [f] : [];
+}
+
+/**
+ * Builds the report for the chosen period. docs: every proof of a kids' line, named after the first
+ * line it backs (R-2026-0003_Dépenses-E3.png), with its SHA-256 computed from the stored file.
+ */
+async function buildReport() {
   const list = shownReceipts().filter(inPeriod).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const docs = new Map();
+  const docsOf = async (r) => {
+    const out = [];
+    for (const f of proofsOf(r)) {
+      if (!docs.has(f.id)) {
+        const label = f.kind === "invoice" ? f.place : f.name.replace(/\.[a-z0-9]+$/i, "");
+        docs.set(f.id, { name: `${r.id}_${docName(label) || f.kind}${extOf(f)}`, blob: f.blob, sha256: await sha256Hex(f.blob) });
+      }
+      out.push(docs.get(f.id));
+    }
+    return out;
+  };
   const lines = [t("xl.hdr")];
   for (const r of list) {
-    for (const it of allocation(r).lines) {
-      if (!it.kids) continue;
+    const kidsLines = allocation(r).lines.filter((it) => it.kids);
+    if (!kidsLines.length) continue;
+    const proofs = await docsOf(r);
+    for (const it of kidsLines) {
       const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
         Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r),
-        [r.source, r.source_ref].filter(Boolean).join(" · "), invoicesOf(r).map((f) => f.place).join(", ")]);
+        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.name).join(", "), proofs.map((d) => d.sha256).join(", ")]);
     }
   }
   const { rows } = account(list);
@@ -766,11 +796,33 @@ async function exportXlsx() {
       [],
     );
   }
-  const blob = await makeXlsx([
+  const xlsx = await makeXlsx([
     { name: t("xl.account"), rows: summary, money: [1], widths: { 0: 44, 1: 20 } },
-    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14 } },
+    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 13: 36, 14: 66 } },
   ]);
-  await shareOrDownload(new File([blob], `${t("xl.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
+  return { xlsx, docs: [...docs.values()] };
+}
+
+const reportBase = () => `${t("xl.file")}-${new Date().toISOString().slice(0, 10)}`;
+
+async function exportXlsx() {
+  const { xlsx } = await buildReport();
+  await shareOrDownload(new File([xlsx], `${reportBase()}.xlsx`, { type: xlsx.type }));
+}
+
+/**
+ * Separate .zip: the report, the invoices of the kids' lines and a checksum list in
+ * sha256sum format (check with `sha256sum -c` / `shasum -a 256 -c`).
+ */
+async function exportReportZip() {
+  const { xlsx, docs } = await buildReport();
+  const base = reportBase();
+  const dir = t("zip.dir");
+  const entries = [{ name: `${base}.xlsx`, data: xlsx }, ...docs.map((d) => ({ name: `${dir}/${d.name}`, data: d.blob }))];
+  const sums = await Promise.all(entries.map(async (e) => `${await sha256Hex(e.data)}  ${e.name}`));
+  entries.push({ name: t("zip.sums"), data: `${sums.join("\n")}\n` });
+  const zip = await makeZip(entries);
+  await shareOrDownload(new File([zip], `${base}.zip`, { type: "application/zip" }));
 }
 
 const safeName = (s) => s.replace(/[^\w.\- ]+/g, "_").slice(0, 80);
@@ -1056,6 +1108,7 @@ $("#processBtn").addEventListener("click", processAll);
 $("#periodFrom").addEventListener("change", renderAccount);
 $("#periodTo").addEventListener("change", renderAccount);
 $("#exportBtn").addEventListener("click", () => exportXlsx().catch((err) => { console.error(err); toast(err.message); }));
+$("#reportZipBtn").addEventListener("click", () => exportReportZip().catch((err) => { console.error(err); toast(err.message); }));
 
 if ("launchQueue" in window) {
   window.launchQueue.setConsumer(async (params) => {
