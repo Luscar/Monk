@@ -483,7 +483,10 @@ function describeError(err) {
   return err?.message || String(err);
 }
 
-/** Claude's guess becomes the starting tag; "unsure" stays untagged for you to decide. */
+/**
+ * Claude's guess becomes the starting tag of a receipt line; "unsure" stays untagged for you to
+ * decide. Lines of an Excel expense list are all kids' expenses: they start as "kids".
+ */
 const SUGGESTION_TO_ALLOC = { yes: "kids", no: "not", unsure: "review" };
 
 /**
@@ -607,7 +610,7 @@ async function createReceipts(file, extracted, byKey = new Map()) {
         description: it.description,
         line_total: it.line_total,
         ai_suggestion: it.likely_for_children,
-        alloc: SUGGESTION_TO_ALLOC[it.likely_for_children] || "review",
+        alloc: x.source_ref ? "kids" : SUGGESTION_TO_ALLOC[it.likely_for_children] || "review",
         split_pct: DEFAULT_SPLIT,
         cat: "base",
       })),
