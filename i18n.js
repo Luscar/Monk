@@ -88,6 +88,7 @@ const DICT = {
     "btn.export": "Download spreadsheet (.xlsx)",
     "btn.reportZip": "Report + invoices (.zip)",
     "zip.dir": "invoices",
+    "doc.prefix": "INV",
     "zip.sums": "checksums.sha256",
 
     "set.lang": "Language",
@@ -142,7 +143,7 @@ const DICT = {
     "xl.file": "kids-expenses",
     "xl.lines": "Kids' lines",
     "xl.account": "Split",
-    "xl.hdr": ["ID", "Date", "Store", "Paid by", "Item", "Amount", "% kids", "Kids' amount", "Type", "My %", "My share", "Currency", "Source", "Invoice (SHA-256)"],
+    "xl.hdr": ["ID", "Date", "Store", "Paid by", "Item", "Amount", "% kids", "Kids' amount", "Type", "My %", "My share", "Currency", "Source", "Invoice", "Invoice SHA-256 (check)"],
     "xl.period": "Period",
     "xl.all": "All dates",
     "xl.currency": "Currency",
@@ -235,6 +236,7 @@ const DICT = {
     "btn.export": "Télécharger le tableur (.xlsx)",
     "btn.reportZip": "Rapport + factures (.zip)",
     "zip.dir": "factures",
+    "doc.prefix": "FAC",
     "zip.sums": "empreintes.sha256",
 
     "set.lang": "Langue",
@@ -289,7 +291,7 @@ const DICT = {
     "xl.file": "depenses-enfants",
     "xl.lines": "Lignes enfants",
     "xl.account": "Partage",
-    "xl.hdr": ["ID", "Date", "Magasin", "Payé par", "Article", "Montant", "% enfants", "Montant enfants", "Type", "Ma %", "Ma part", "Devise", "Source", "Facture (SHA-256)"],
+    "xl.hdr": ["ID", "Date", "Magasin", "Payé par", "Article", "Montant", "% enfants", "Montant enfants", "Type", "Ma %", "Ma part", "Devise", "Source", "Facture", "Empreinte SHA-256 facture (vérification)"],
     "xl.period": "Période",
     "xl.all": "Toutes les dates",
     "xl.currency": "Devise",

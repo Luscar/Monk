@@ -1008,19 +1008,32 @@ function proofsOf(r) {
   return f?.blob ? [f] : [];
 }
 
+/** "F-12" → "F-12"; anything unusable as a file name → "". */
+const docName = (s) => String(s ?? "").normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+
 /**
- * Builds the report for the chosen period. docs: every proof of a kids' line, once per content:
- * its SHA-256 (computed from the stored file) is both its identifier in the report and its file
- * name in the zip, so lines sharing an invoice show the same value.
+ * Builds the report for the chosen period. docs: every proof of a kids' line, once per content
+ * (same SHA-256 = same invoice). Each gets a short readable identifier, used both in the report
+ * and as its file name in the zip: the identifier written above the picture in the workbook
+ * (F-12), else FAC-001, FAC-002… in report order. The SHA-256 stays alongside, for checking.
  */
 async function buildReport() {
   const list = shownReceipts().filter(inPeriod).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const docs = new Map();
+  const usedIds = new Set();
+  let seqNo = 0;
   const docsOf = async (r) => {
     const out = [];
     for (const f of proofsOf(r)) {
       const sha256 = await sha256Hex(f.blob);
-      if (!docs.has(sha256)) docs.set(sha256, { name: `${sha256}${extOf(f)}`, blob: f.blob, sha256 });
+      if (!docs.has(sha256)) {
+        let id = f.kind === "invoice" ? docName(f.label) : "";
+        if (!id || usedIds.has(id.toLowerCase())) {
+          do id = `${t("doc.prefix")}-${String(++seqNo).padStart(3, "0")}`; while (usedIds.has(id.toLowerCase()));
+        }
+        usedIds.add(id.toLowerCase());
+        docs.set(sha256, { id, name: `${id}${extOf(f)}`, blob: f.blob, sha256 });
+      }
       if (!out.includes(docs.get(sha256))) out.push(docs.get(sha256));
     }
     return out;
@@ -1034,7 +1047,7 @@ async function buildReport() {
       const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
         Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r),
-        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.sha256).join(", ")]);
+        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.id).join(", "), proofs.map((d) => d.sha256).join(", ")]);
     }
   }
   const { rows } = account(list);
@@ -1058,7 +1071,7 @@ async function buildReport() {
   }
   const xlsx = await makeXlsx([
     { name: t("xl.account"), rows: summary, money: [1], widths: { 0: 44, 1: 20 } },
-    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 12: 36, 13: 66 } },
+    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 12: 36, 13: 16, 14: 66 } },
   ]);
   return { xlsx, docs: [...docs.values()] };
 }
