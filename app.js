@@ -1,7 +1,7 @@
 import Anthropic from "./vendor/anthropic-sdk.js";
 import { db } from "./db.js";
 import { makeZip, readZip } from "./zip.js";
-import { makeXlsx, readXlsx, readCsv, sheetsToText } from "./xlsx.js";
+import { makeXlsx, readWorkbook, readCsv, sheetsToText } from "./xlsx.js";
 import { t, locale, regionCurrency, applyStatic } from "./i18n.js";
 
 // ---------------------------------------------------------------------------
@@ -74,10 +74,9 @@ const RECEIPT_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["store_name", "date", "currency", "items", "tax", "total", "source_ref"],
+        required: ["store_name", "date", "currency", "items", "tax", "total"],
         properties: {
           store_name: { type: "string" },
-          source_ref: { type: "string", description: "Spreadsheets only: sheet and row, e.g. 'Sheet1 L12'. Empty string for photos/PDFs" },
           date: { ...nullable("string"), description: "Purchase date YYYY-MM-DD" },
           currency: { type: "string", description: "ISO 4217 code" },
           items: {
@@ -109,15 +108,58 @@ Rules:
 - Skip non-purchase lines (subtotals, payment, change, loyalty points, deposits returned).
 - date is the printed purchase date (YYYY-MM-DD), never today. Use null for anything not printed or not legible. Never invent values.
 - likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items (general groceries, cleaning products, fuel).
-- Spreadsheets (an expense list someone typed): each row that records an expense becomes one entry with a single line (unless the row clearly lists several), using the row's own date, description and amount. store_name is the merchant if a column gives it, otherwise a short description. source_ref is the sheet and row (e.g. "Sheet1 L12"). Skip headers, totals, subtotals, empty rows and side calculations or reference tables beside the list. tax and total are null unless the row has its own columns for them. Amounts may use a comma as decimal separator.
 - If the file contains no receipt or expense, return an empty receipts array.`;
+
+/**
+ * Spreadsheets: the grid is the source. Every expense row of the grid gives exactly one line;
+ * an invoice picture is only attached to a row, it never creates, merges or splits lines.
+ */
+const SHEET_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["rows"],
+  properties: {
+    rows: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["sheet", "row", "date", "store_name", "description", "amount", "currency", "likely_for_children", "picture_ids"],
+        properties: {
+          sheet: { type: "string", description: "Sheet name, exactly as after '### Sheet:'" },
+          row: { type: "integer", description: "Row number N from the 'LN:' prefix" },
+          date: { ...nullable("string"), description: "The row's date YYYY-MM-DD" },
+          store_name: { type: "string", description: "Merchant if a column gives it, otherwise a short description" },
+          description: { type: "string", description: "Short item name from the row" },
+          amount: { type: "number", description: "The row's amount (negative for a refund or discount row)" },
+          currency: { type: "string", description: "ISO 4217 code" },
+          likely_for_children: { type: "string", enum: ["yes", "no", "unsure"] },
+          picture_ids: { type: "array", items: { type: "string" }, description: "Invoice pictures (P1, P2…) for this row; empty if none" },
+        },
+      },
+    },
+  },
+};
+
+const SHEET_PROMPT = `You read an expense list someone typed in a spreadsheet, for a parent who splits the children's expenses with the other parent. Each line of the grid is given as "LN: cell | cell | …" under "### Sheet: name".
+
+Rules:
+- Return exactly one entry per grid row that records an expense, in grid order: the row's own date, merchant, description and amount. Never merge several rows into one entry, never split one row into several, never skip an expense row.
+- Skip only rows that are not expenses: headers, totals, subtotals, empty rows, and side calculations or reference tables beside the list.
+- Amounts are plain numbers and may use a comma as decimal separator in the grid. date is YYYY-MM-DD or null; never invent values.
+- likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult; "unsure" for shared household items.
+- Invoice pictures pasted in the workbook appear as [picture P3] (in a cell, or at the end of the row where a floating picture starts, with the rows it covers). You only see where they are, not what they show. Pictures never create rows: they are only attached to a row when possible. In picture_ids put the pictures that are the invoice for that row: a picture in the row, or starting on it, belongs to it; a picture on another sheet or on its own row goes to the row its caption or neighbouring cells match (store, date, amount, invoice number). One picture may back several rows; a row may have none. When unsure, leave picture_ids empty.`;
 
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
-/** Original files: {id, name, type, kind, size, addedAt, sha256, blob, status, error, receiptIds, payer} */
+/**
+ * Original files: {id, name, type, kind, size, addedAt, sha256, blob, status, error, receiptIds, payer}.
+ * Invoice pictures found in a workbook are files too: kind "invoice", parentId = the workbook's id,
+ * picKey ("P1"), place ("Sheet1 C12"), receiptIds = the entries they back.
+ */
 let files = [];
-/** Receipts: {id, fileId, source, sha256, payer, store_name, date, currency, tax, total, items[{description, line_total, ai_suggestion, alloc, split_pct, cat: "base"|"special"}]} */
+/** Receipts: {id, fileId, invoiceIds, source, sha256, payer, store_name, date, currency, tax, total, items[{description, line_total, ai_suggestion, alloc, split_pct, cat: "base"|"special"}]} */
 let receipts = [];
 let seq = 0;
 let processing = false;
@@ -231,7 +273,7 @@ async function addFiles(fileList) {
     if (!kind) { toast(t("t.unsupported", { name: file.name })); continue; }
     if (kind === "pdf" && file.size > MAX_PDF_BYTES) { toast(t("t.pdfTooBig", { name: file.name }), 4000); continue; }
     const sha256 = await sha256Hex(file);
-    if (files.some((f) => f.sha256 === sha256)) { toast(t("t.already", { name: file.name }), 4000); continue; }
+    if (files.some((f) => f.sha256 === sha256 && f.kind !== "invoice")) { toast(t("t.already", { name: file.name }), 4000); continue; }
     const rec = {
       id: `F-${uid()}`,
       name: file.name || (kind === "pdf" ? "document.pdf" : "photo.jpg"),
@@ -251,10 +293,14 @@ async function addFiles(fileList) {
   render();
 }
 
+/** Removes a file and the invoice pictures taken from it. */
 async function removeFile(id) {
-  files = files.filter((f) => f.id !== id);
-  if (thumbs.has(id)) { URL.revokeObjectURL(thumbs.get(id)); thumbs.delete(id); }
-  await db.del("files", id);
+  const gone = files.filter((f) => f.id === id || (f.kind === "invoice" && f.parentId === id));
+  files = files.filter((f) => !gone.includes(f));
+  for (const f of gone) {
+    if (thumbs.has(f.id)) { URL.revokeObjectURL(thumbs.get(f.id)); thumbs.delete(f.id); }
+    await db.del("files", f.id);
+  }
   render();
 }
 
@@ -283,11 +329,16 @@ async function prepareImage(blob, type) {
 // ---------------------------------------------------------------------------
 // 2. Extract
 // ---------------------------------------------------------------------------
-async function fileSource(file) {
+const isCsv = (file) => /\.csv$/i.test(file.name) || file.type === "text/csv";
+
+/** Workbook cells and pictures. Only the cell values (and where each picture sits) go to Claude. */
+async function readSheetFile(file) {
+  return isCsv(file) ? { sheets: readCsv(await file.blob.text()), pictures: [] } : readWorkbook(file.blob);
+}
+
+async function fileSource(file, wb) {
   if (file.kind === "sheet") {
-    // Data only: the cell values are sent as text; pictures inside a workbook are ignored.
-    const sheets = /\.csv$/i.test(file.name) || file.type === "text/csv" ? readCsv(await file.blob.text()) : await readXlsx(file.blob);
-    return { type: "text", text: `<spreadsheet name="${file.name}">\n${sheetsToText(sheets)}\n</spreadsheet>` };
+    return { type: "text", text: `<spreadsheet name="${file.name}">\n${sheetsToText(wb.sheets, wb.pictures)}\n</spreadsheet>` };
   }
   if (file.kind === "pdf") {
     return { type: "document", source: { type: "base64", media_type: "application/pdf", data: await readAsBase64(file.blob) } };
@@ -297,17 +348,18 @@ async function fileSource(file) {
 }
 
 async function extract(client, file) {
+  const wb = file.kind === "sheet" ? await readSheetFile(file) : null;
   const kids = settings.kidsContext ? `\nAbout the children: ${settings.kidsContext}` : "";
   const params = {
     model: settings.model,
-    max_tokens: 16000,
-    system: SYSTEM_PROMPT,
-    output_config: { effort: "medium", format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
+    max_tokens: wb ? 32000 : 16000,
+    system: wb ? SHEET_PROMPT : SYSTEM_PROMPT,
+    output_config: { effort: "medium", format: { type: "json_schema", schema: wb ? SHEET_SCHEMA : RECEIPT_SCHEMA } },
     messages: [{
       role: "user",
-      content: [await fileSource(file), {
+      content: [await fileSource(file, wb), {
         type: "text",
-        text: `${file.kind === "sheet" ? "Turn each expense row of this spreadsheet into an entry" : `Extract the receipt(s) in this ${file.kind === "pdf" ? "PDF" : "image"}`} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}`,
+        text: `${file.kind === "sheet" ? "Return one entry per expense row of this grid" : `Extract the receipt(s) in this ${file.kind === "pdf" ? "PDF" : "image"}`} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}`,
       }],
     }],
   };
@@ -319,7 +371,38 @@ async function extract(client, file) {
   if (message.stop_reason === "refusal") throw new Error(t("e.refused"));
   if (message.stop_reason === "max_tokens") throw new Error(t("e.cutoff"));
   const text = message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-  try { return JSON.parse(text).receipts || []; } catch { throw new Error(t("e.unreadable")); }
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(t("e.unreadable")); }
+  if (!wb) return { receipts: data.receipts || [], pictures: [] };
+  return { receipts: rowsToEntries(wb.sheets, data.rows || []), pictures: wb.pictures };
+}
+
+/**
+ * One entry per grid row: rows that don't exist or are empty in the grid are dropped,
+ * a row returned twice is kept once, and entries follow the grid order.
+ */
+function rowsToEntries(sheets, rows) {
+  const order = new Map(sheets.map((s, i) => [s.name, i]));
+  const seen = new Set();
+  return rows
+    .filter((x) => {
+      const cells = sheets[order.get(x.sheet)]?.rows[x.row - 1];
+      const key = `${x.sheet}\u0000${x.row}`;
+      if (!cells?.some((v) => v != null && String(v).trim() !== "") || seen.has(key) || !Number.isFinite(x.amount)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => order.get(a.sheet) - order.get(b.sheet) || a.row - b.row)
+    .map((x) => ({
+      store_name: x.store_name || x.description,
+      date: x.date,
+      currency: x.currency,
+      source_ref: `${x.sheet} L${x.row}`,
+      picture_ids: x.picture_ids,
+      tax: null,
+      total: null,
+      items: [{ description: x.description || x.store_name, line_total: x.amount, likely_for_children: x.likely_for_children }],
+    }));
 }
 
 function describeError(err) {
@@ -335,13 +418,76 @@ function describeError(err) {
 /** Claude's guess becomes the starting tag; "unsure" stays untagged for you to decide. */
 const SUGGESTION_TO_ALLOC = { yes: "kids", no: "not", unsure: "review" };
 
-async function createReceipts(file, extracted) {
+/**
+ * Keeps each workbook picture as an invoice file (replacing those of an earlier attempt).
+ * Returns picKey → file.
+ */
+async function saveInvoices(file, pictures) {
+  for (const old of files.filter((f) => f.kind === "invoice" && f.parentId === file.id)) {
+    files = files.filter((f) => f !== old);
+    await db.del("files", old.id);
+  }
+  const byKey = new Map();
+  for (const p of pictures) {
+    const pl = p.places[0];
+    const place = pl.row == null ? pl.sheet : `${pl.sheet} ${colLetters(pl.col)}${pl.row + 1}`;
+    const rec = {
+      id: `F-${uid()}`,
+      parentId: file.id,
+      kind: "invoice",
+      name: `${file.name.replace(/\.\w+$/, "")} – ${place}.${p.type.split("/")[1].replace("jpeg", "jpg")}`,
+      type: p.type,
+      size: p.blob.size,
+      addedAt: file.addedAt,
+      sha256: await sha256Hex(p.blob),
+      blob: p.blob,
+      status: "done",
+      receiptIds: [],
+      payer: file.payer,
+      picKey: p.key,
+      place,
+      rows: p.places.filter((x) => x.row != null).map((x) => ({ sheet: x.sheet, row: x.row + 1 })),
+    };
+    files.push(rec);
+    await saveFile(rec);
+    byKey.set(p.key, rec);
+  }
+  return byKey;
+}
+
+function colLetters(i) {
+  let s = "";
+  for (let n = (i ?? 0) + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
+  return s;
+}
+
+/** "Sheet1 L12" → {sheet, row}. */
+function parseRef(ref) {
+  const m = String(ref || "").trim().match(/^(.*?)\s*L(\d+)$/i);
+  return m ? { sheet: m[1].replace(/^Sheet:\s*/i, "").trim(), row: Number(m[2]) } : null;
+}
+
+/**
+ * The invoices of an entry: those Claude named, else any picture placed on the entry's own row.
+ */
+function invoicesFor(x, byKey) {
+  const named = (x.picture_ids || []).map((k) => byKey.get(String(k).trim().toUpperCase())).filter(Boolean);
+  if (named.length) return [...new Set(named)];
+  const ref = parseRef(x.source_ref);
+  if (!ref) return [];
+  return [...byKey.values()].filter((f) => f.rows.some((p) => p.row === ref.row && (!ref.sheet || p.sheet === ref.sheet)));
+}
+
+async function createReceipts(file, extracted, byKey = new Map()) {
   const ids = [];
-  for (const x of extracted) {
+  const touched = new Set();
+  for (const { picture_ids, ...x } of extracted) {
+    const invoices = invoicesFor({ ...x, picture_ids }, byKey);
     const r = {
       ...x,
       id: nextReceiptId(),
       fileId: file.id,
+      invoiceIds: invoices.map((f) => f.id),
       source: file.name,
       sha256: file.sha256,
       addedAt: file.addedAt,
@@ -358,7 +504,9 @@ async function createReceipts(file, extracted) {
     receipts.push(r);
     ids.push(r.id);
     await saveReceipt(r);
+    for (const f of invoices) { f.receiptIds.push(r.id); touched.add(f); }
   }
+  for (const f of touched) await saveFile(f);
   return ids;
 }
 
@@ -378,8 +526,9 @@ async function processAll() {
       file.status = "working";
       render();
       try {
-        const extracted = await extract(client, file);
-        file.receiptIds = await createReceipts(file, extracted);
+        const { receipts: extracted, pictures } = await extract(client, file);
+        const byKey = await saveInvoices(file, pictures);
+        file.receiptIds = await createReceipts(file, extracted, byKey);
         file.status = "done";
         if (!extracted.length) toast(t("t.noReceipt", { name: file.name }), 4000);
       } catch (err) {
@@ -521,6 +670,10 @@ async function deleteReceipt(r) {
   if (!confirm(t("c.delete", { id: r.id, store: r.store_name || t("unknownStore") }))) return;
   receipts = receipts.filter((x) => x.id !== r.id);
   await db.del("receipts", r.id);
+  for (const inv of invoicesOf(r)) {
+    inv.receiptIds = inv.receiptIds.filter((id) => id !== r.id);
+    await saveFile(inv);
+  }
   const f = files.find((x) => x.id === r.fileId);
   if (f) {
     f.receiptIds = (f.receiptIds || []).filter((id) => id !== r.id);
@@ -530,12 +683,51 @@ async function deleteReceipt(r) {
   render();
 }
 
-function viewOriginal(r) {
-  const f = files.find((x) => x.id === r.fileId);
+function openBlob(f) {
   if (!f?.blob) return;
   const url = URL.createObjectURL(f.blob);
   window.open(url, "_blank");
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+const viewOriginal = (r) => openBlob(files.find((x) => x.id === r.fileId));
+
+/** Invoice pictures linked to an entry, and all those of the workbook it came from. */
+const invoicesOf = (r) => (r.invoiceIds || []).map((id) => files.find((f) => f.id === id)).filter(Boolean);
+const workbookInvoices = (r) => files.filter((f) => f.kind === "invoice" && f.parentId === r.fileId)
+  .sort((a, b) => a.picKey.localeCompare(b.picKey, undefined, { numeric: true }));
+
+/** Links or unlinks one workbook picture to an entry. */
+async function toggleInvoice(r, inv) {
+  const linked = (r.invoiceIds || []).includes(inv.id);
+  r.invoiceIds = linked ? r.invoiceIds.filter((id) => id !== inv.id) : [...(r.invoiceIds || []), inv.id];
+  inv.receiptIds = linked ? inv.receiptIds.filter((id) => id !== r.id) : [...inv.receiptIds, r.id];
+  await Promise.all([saveReceipt(r), saveFile(inv)]);
+  render();
+  renderInvoiceDialog(r);
+}
+
+let invoiceDialogFor = null;
+function openInvoiceDialog(r) {
+  invoiceDialogFor = r.id;
+  renderInvoiceDialog(r);
+  $("#invoiceDialog").showModal();
+}
+
+function renderInvoiceDialog(r) {
+  if (invoiceDialogFor !== r.id) return;
+  $("#invoiceFor").textContent = [r.store_name || t("unknownStore"), r.date, r.source_ref].filter(Boolean).join(" · ");
+  $("#invoiceGrid").replaceChildren(...workbookInvoices(r).map((inv) => {
+    const on = (r.invoiceIds || []).includes(inv.id);
+    const others = inv.receiptIds.filter((id) => id !== r.id).map((id) => receipts.find((x) => x.id === id)?.source_ref || id);
+    return h("div", { class: `pic ${on ? "on" : ""}` },
+      h("button", { type: "button", class: "pic-img", "aria-label": t("inv.open", { place: inv.place }), onclick: () => openBlob(inv) },
+        h("img", { src: thumbFor(inv), alt: "" })),
+      h("div", { class: "pic-meta" }, `${inv.picKey} · ${inv.place}`),
+      others.length ? h("div", { class: "pic-meta" }, t("inv.alsoOn", { refs: others.join(", ") })) : null,
+      h("button", { type: "button", class: `btn small ${on ? "primary" : ""}`, "aria-pressed": String(on), onclick: () => toggleInvoice(r, inv) },
+        t(on ? "inv.linked" : "inv.link")));
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -551,7 +743,8 @@ async function exportXlsx() {
       if (!it.kids) continue;
       const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
-        Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r)]);
+        Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r),
+        [r.source, r.source_ref].filter(Boolean).join(" · "), invoicesOf(r).map((f) => f.place).join(", ")]);
     }
   }
   const { rows } = account(list);
@@ -582,6 +775,7 @@ async function exportXlsx() {
 
 const safeName = (s) => s.replace(/[^\w.\- ]+/g, "_").slice(0, 80);
 function originalPath(f) {
+  if (f.kind === "invoice") return `originals/invoices/${f.parentId}__${f.picKey}__${safeName(f.place || "")}${(f.name.match(/\.[a-z0-9]+$/i) || [".png"])[0]}`;
   const ext = (f.name.match(/\.[a-z0-9]+$/i) || [""])[0] || (f.kind === "pdf" ? ".pdf" : ".jpg");
   return `originals/${(f.receiptIds || []).join("+") || f.id}__${safeName(f.name.replace(/\.[a-z0-9]+$/i, ""))}${ext}`;
 }
@@ -607,11 +801,12 @@ async function restore(zipFile) {
   if (!Array.isArray(data.receipts) || !Array.isArray(data.files)) throw new Error(t("e.notBackup"));
   let nf = 0, nr = 0;
   for (const meta of data.files) {
-    if (meta.withheld || files.some((f) => f.id === meta.id || f.sha256 === meta.sha256)) continue;
+    const dup = files.some((f) => f.id === meta.id || (meta.kind !== "invoice" && f.kind !== "invoice" && f.sha256 === meta.sha256));
+    if (meta.withheld || dup) continue;
     const blob = await zip.blob(prefix + (meta.packPath || originalPath(meta)), meta.type);
     if (!blob || (await sha256Hex(blob)) !== meta.sha256) continue;
     const { packPath, ...rest } = meta;
-    const rec = { ...rest, blob, status: rest.receiptIds?.length ? "done" : rest.status === "done" ? "done" : "pending" };
+    const rec = { ...rest, blob, status: rest.kind === "invoice" || rest.receiptIds?.length ? "done" : rest.status === "done" ? "done" : "pending" };
     files.push(rec);
     await saveFile(rec);
     nf += 1;
@@ -639,7 +834,7 @@ const queueFiles = () => files.filter((f) => f.status !== "done" && (f.kind === 
   && !f.sensitive && !f.parentId && f.role !== "statement");
 
 function thumbFor(f) {
-  if (f.kind !== "image" || !f.blob) return null;
+  if ((f.kind !== "image" && f.kind !== "invoice") || !f.blob) return null;
   if (!thumbs.has(f.id)) thumbs.set(f.id, URL.createObjectURL(f.blob));
   return thumbs.get(f.id);
 }
@@ -670,6 +865,9 @@ function render() {
   const untagged = shown.reduce((n, r) => n + allocation(r).pending, 0);
   $("#untagged").hidden = !untagged;
   $("#untagged").textContent = t("list.untagged", { n: untagged });
+  const loose = files.filter((f) => f.kind === "invoice" && !f.receiptIds.length && shown.some((r) => r.fileId === f.parentId)).length;
+  $("#unlinkedPics").hidden = !loose;
+  $("#unlinkedPics").textContent = t("list.unlinkedPics", { n: loose });
   const sorted = shown.slice().sort((a, b) => (b.date || "").localeCompare(a.date || "") || b.id.localeCompare(a.id));
   $("#receipts").replaceChildren(...sorted.map(renderReceipt));
 
@@ -679,6 +877,8 @@ function render() {
 function renderReceipt(r) {
   const c = curOf(r);
   const a = allocation(r);
+  const invoices = invoicesOf(r);
+  const pool = workbookInvoices(r);
   const rows = a.lines.map((it, idx) => h("tr", { class: it.alloc === "not" ? "not-kids" : "" },
     h("td", { class: "tagcell" },
       it.linked ? h("span", { class: "tag linked" }, "↳") : h("button", {
@@ -714,8 +914,13 @@ function renderReceipt(r) {
         h("tfoot", {},
           r.tax != null && h("tr", {}, h("td", {}), h("td", {}, t("tax")), h("td", { class: "num" }, fmtNum(r.tax))),
           h("tr", { class: "grand" }, h("td", {}), h("td", {}, t("total")), h("td", { class: "num" }, fmtMoney(a.total, c)))))),
+    invoices.length ? h("div", { class: "invoices" },
+      h("span", { class: "meta" }, t("inv.label")),
+      invoices.map((inv) => h("button", { class: "inv-thumb", "aria-label": t("inv.open", { place: inv.place }), title: inv.place, onclick: () => openBlob(inv) },
+        h("img", { src: thumbFor(inv), alt: "" })))) : null,
     h("div", { class: "actions" },
-      h("button", { class: "btn small", onclick: () => viewOriginal(r) }, t("btn.view")),
+      h("button", { class: "btn small", onclick: () => viewOriginal(r) }, t(r.source_ref ? "btn.viewSheet" : "btn.view")),
+      pool.length ? h("button", { class: "btn small", onclick: () => openInvoiceDialog(r) }, t("inv.btn", { n: invoices.length, total: pool.length })) : null,
       h("button", { class: "btn small", onclick: () => update(r, () => r.items.forEach((it) => { it.alloc = "kids"; })) }, t("btn.allKids")),
       h("button", { class: "btn small", onclick: () => update(r, () => r.items.forEach((it) => { it.alloc = "not"; })) }, t("btn.noneKids")),
       h("button", { class: "btn small", onclick: () => editReceipt(r) }, t("btn.edit")),
@@ -806,6 +1011,8 @@ $("#wipeBtn").addEventListener("click", async () => {
   toast(t("t.wiped"));
   render();
 });
+
+$("#invoiceDialog").addEventListener("close", () => { invoiceDialogFor = null; });
 
 $("#backupBtn").addEventListener("click", () => backup().catch((err) => { console.error(err); toast(err.message); }));
 $("#restoreInput").addEventListener("change", async (e) => {

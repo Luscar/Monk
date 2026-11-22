@@ -74,7 +74,8 @@ export async function makeXlsx(sheets) {
 }
 
 // ---------------------------------------------------------------------------
-// Reading spreadsheets (data only: pictures in a workbook are ignored)
+// Reading spreadsheets: cell values, plus the pictures pasted in the workbook (scanned invoices)
+// with the cell they sit on, so each expense row can be linked to its invoice.
 // ---------------------------------------------------------------------------
 const REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const all = (node, tag) => (node ? [...node.getElementsByTagNameNS("*", tag)] : []);
@@ -96,28 +97,60 @@ function isDateFormat(id, custom) {
 
 const serialToIso = (v) => new Date(Date.UTC(1899, 11, 30) + Math.round(v * 86400000)).toISOString().slice(0, 10);
 
-/** Returns [{name, rows: any[][]}] for every sheet of an .xlsx file. Dates come back as YYYY-MM-DD. */
-export async function readXlsx(blob) {
+/** Resolves a relationship target against the folder of the part that owns it. */
+function resolvePart(owner, target) {
+  if (target.startsWith("/")) return target.slice(1);
+  const parts = owner.split("/").slice(0, -1);
+  for (const seg of target.split("/")) {
+    if (seg === "..") parts.pop();
+    else if (seg && seg !== ".") parts.push(seg);
+  }
+  return parts.join("/");
+}
+const relsPath = (part) => part.replace(/([^/]+)$/, "_rels/$1.rels");
+
+/** Picture types a browser can show. EMF/WMF (mostly shapes and icons) are skipped. */
+const PICTURE_TYPES = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", bmp: "image/bmp" };
+
+/**
+ * Reads an .xlsx file.
+ * sheets: [{name, rows: any[][]}] — dates come back as YYYY-MM-DD; a picture placed in a cell reads "[picture P1]".
+ * pictures: [{key: "P1", path, type, blob, places: [{sheet, row, rowEnd, col, inCell}]}] — rows/cols 0-based.
+ * The same image pasted twice is one picture with two places.
+ */
+export async function readWorkbook(blob) {
   const zip = await readZip(blob);
   const xml = async (name) => {
     const s = await zip.text(name);
     return s ? new DOMParser().parseFromString(s, "application/xml") : null;
   };
+  const relMap = async (part) => new Map(all(await xml(relsPath(part)), "Relationship")
+    .filter((r) => r.getAttribute("TargetMode") !== "External")
+    .map((r) => [r.getAttribute("Id"), resolvePart(part, r.getAttribute("Target") || "")]));
+
   const wb = await xml("xl/workbook.xml");
   if (!wb) throw new Error("Not an Excel workbook.");
-  const rels = await xml("xl/_rels/workbook.xml.rels");
-  const target = new Map(all(rels, "Relationship").map((r) => [r.getAttribute("Id"), r.getAttribute("Target")]));
+  const target = await relMap("xl/workbook.xml");
   const shared = all(await xml("xl/sharedStrings.xml"), "si").map(textOf);
   const styles = await xml("xl/styles.xml");
   const custom = new Map(all(styles, "numFmt").map((n) => [Number(n.getAttribute("numFmtId")), n.getAttribute("formatCode")]));
   const xfs = all(all(styles, "cellXfs")[0], "xf").map((x) => Number(x.getAttribute("numFmtId") || 0));
 
-  const out = [];
+  const pictures = new Map();
+  const picture = (path) => {
+    const type = PICTURE_TYPES[(path.match(/\.(\w+)$/) || [])[1]?.toLowerCase()];
+    if (!type || !zip.names.includes(path)) return null;
+    if (!pictures.has(path)) pictures.set(path, { key: `P${pictures.size + 1}`, path, type, places: [] });
+    return pictures.get(path);
+  };
+  const inCell = await inCellPictures(xml, relMap);
+
+  const sheets = [];
   for (const sh of all(wb, "sheet")) {
-    let path = target.get(sh.getAttributeNS(REL_NS, "id") || sh.getAttribute("r:id")) || "";
-    path = path.startsWith("/") ? path.slice(1) : `xl/${path}`;
+    const path = target.get(sh.getAttributeNS(REL_NS, "id") || sh.getAttribute("r:id")) || "";
     const doc = await xml(path);
     if (!doc) continue;
+    const name = sh.getAttribute("name") || "Sheet";
     const rows = [];
     for (const row of all(doc, "row")) {
       const r = Number(row.getAttribute("r")) - 1;
@@ -127,7 +160,12 @@ export async function readXlsx(blob) {
         const tp = c.getAttribute("t");
         const v = all(c, "v")[0]?.textContent;
         let val = null;
-        if (tp === "s") val = shared[Number(v)] ?? "";
+        const vm = c.getAttribute("vm");
+        const pic = vm && inCell(Number(vm)) ? picture(inCell(Number(vm))) : null;
+        if (pic) {
+          pic.places.push({ sheet: name, row: r, rowEnd: r, col: i, inCell: true });
+          val = `[picture ${pic.key}]`;
+        } else if (tp === "s") val = shared[Number(v)] ?? "";
         else if (tp === "inlineStr") val = textOf(all(c, "is")[0]);
         else if (tp === "str" || tp === "e") val = v ?? "";
         else if (tp === "b") val = v === "1" ? "TRUE" : "FALSE";
@@ -139,9 +177,63 @@ export async function readXlsx(blob) {
       }
       rows[r >= 0 ? r : rows.length] = cells;
     }
-    out.push({ name: sh.getAttribute("name") || "Sheet", rows: rows.map((r) => r || []) });
+
+    // Floating pictures: sheet → drawing → image, anchored on a cell.
+    const sheetRels = await relMap(path);
+    for (const d of all(doc, "drawing")) {
+      const drawingPath = sheetRels.get(d.getAttributeNS(REL_NS, "id") || d.getAttribute("r:id"));
+      const drawing = drawingPath && await xml(drawingPath);
+      if (!drawing) continue;
+      const media = await relMap(drawingPath);
+      const anchors = [...all(drawing, "twoCellAnchor"), ...all(drawing, "oneCellAnchor"), ...all(drawing, "absoluteAnchor")];
+      for (const a of anchors) {
+        const at = (tag, field) => {
+          const n = all(all(a, tag)[0], field)[0];
+          return n ? Number(n.textContent) : null;
+        };
+        const row = at("from", "row");
+        const place = { sheet: name, row, rowEnd: at("to", "row") ?? row, col: at("from", "col"), inCell: false };
+        for (const blip of all(a, "blip")) {
+          const pic = picture(media.get(blip.getAttributeNS(REL_NS, "embed") || blip.getAttribute("r:embed")) || "");
+          if (pic && !pic.places.some((p) => p.sheet === name && p.row === row && p.col === place.col)) pic.places.push(place);
+        }
+      }
+    }
+    sheets.push({ name, rows: rows.map((r) => r || []) });
   }
-  return out;
+
+  const list = [...pictures.values()].filter((p) => p.places.length);
+  for (const p of list) p.blob = await zip.blob(p.path, p.type);
+  return { sheets, pictures: list };
+}
+
+/**
+ * Pictures placed *in* a cell (Excel 365 "Place in cell"): the cell's vm index leads, through
+ * metadata.xml and the rich-value parts, to an image. Returns vm → image path (or null).
+ */
+async function inCellPictures(xml, relMap) {
+  const meta = await xml("xl/metadata.xml");
+  const values = await xml("xl/richData/rdrichvalue.xml");
+  if (!meta || !values) return () => null;
+  const structures = all(await xml("xl/richData/rdrichvaluestructure.xml"), "s")
+    .map((s) => all(s, "k").map((k) => k.getAttribute("n")));
+  const relIds = all(await xml("xl/richData/richValueRel.xml"), "rel").map((r) => r.getAttributeNS(REL_NS, "id") || r.getAttribute("r:id"));
+  const rels = await relMap("xl/richData/richValueRel.xml");
+  const rich = all(values, "rv").map((rv) => {
+    const keys = structures[Number(rv.getAttribute("s") || 0)] || [];
+    const at = keys.indexOf("_rvRel:LocalImageIdentifier");
+    const v = all(rv, "v")[at >= 0 ? at : 0]?.textContent;
+    return v == null ? null : rels.get(relIds[Number(v)]) || null;
+  });
+  const types = all(meta, "metadataType").map((m) => m.getAttribute("name"));
+  const future = all(all(meta, "futureMetadata").find((f) => f.getAttribute("name") === "XLRICHVALUE"), "bk")
+    .map((bk) => Number(all(bk, "rvb")[0]?.getAttribute("i")));
+  const cellMeta = all(all(meta, "valueMetadata")[0], "bk").map((bk) => all(bk, "rc")[0]);
+  return (vm) => {
+    const rc = cellMeta[vm - 1];
+    if (!rc || types[Number(rc.getAttribute("t")) - 1] !== "XLRICHVALUE") return null;
+    return rich[future[Number(rc.getAttribute("v"))]] ?? null;
+  };
 }
 
 /** CSV with automatic separator detection (comma, semicolon or tab). */
@@ -167,17 +259,39 @@ export function readCsv(text) {
   return [{ name: "CSV", rows }];
 }
 
-/** Turns sheets into compact text for Claude: one line per row, with sheet name and row number. */
-export function sheetsToText(sheets, maxRows = 1500) {
+const cellName = (col, row) => `${colName(col ?? 0)}${row + 1}`;
+
+/**
+ * Turns sheets into compact text for Claude: one line per row, with sheet name and row number.
+ * Floating pictures are noted at the end of the row where they start; pictures on no sheet row
+ * are listed after the sheet.
+ */
+export function sheetsToText(sheets, pictures = [], maxRows = 1500) {
   const lines = [];
   for (const s of sheets) {
-    const rows = s.rows.map((r, i) => [i + 1, r]).filter(([, r]) => r.some((v) => v != null && String(v).trim() !== ""));
+    const floating = new Map();
+    for (const p of pictures) {
+      for (const pl of p.places) {
+        if (pl.sheet !== s.name || pl.inCell || pl.row == null) continue;
+        const span = pl.rowEnd > pl.row ? `, covers L${pl.row + 1}–L${pl.rowEnd + 1}` : "";
+        if (!floating.has(pl.row)) floating.set(pl.row, []);
+        floating.get(pl.row).push(`[picture ${p.key} at ${cellName(pl.col, pl.row)}${span}]`);
+      }
+    }
+    const rows = s.rows.map((r, i) => [i + 1, r])
+      .filter(([n, r]) => floating.has(n - 1) || r.some((v) => v != null && String(v).trim() !== ""));
+    for (const row of floating.keys()) if (row >= s.rows.length) rows.push([row + 1, []]);
+    rows.sort((a, b) => a[0] - b[0]);
     if (!rows.length) continue;
     lines.push(`### Sheet: ${s.name}`);
     for (const [n, r] of rows.slice(0, maxRows)) {
-      lines.push(`L${n}: ${Array.from(r, (v) => (v == null ? "" : String(v).replace(/\s+/g, " ").trim())).join(" | ")}`);
+      const cells = Array.from(r, (v) => (v == null ? "" : String(v).replace(/\s+/g, " ").trim())).join(" | ");
+      const pics = floating.get(n - 1);
+      lines.push(`L${n}: ${cells}${pics ? `${cells ? "   " : ""}${pics.join(" ")}` : ""}`);
     }
     if (rows.length > maxRows) lines.push(`… ${rows.length - maxRows} more rows not shown`);
   }
+  const loose = pictures.filter((p) => p.places.every((pl) => pl.row == null));
+  if (loose.length) lines.push(`### Pictures with no cell position: ${loose.map((p) => `${p.key} (sheet ${p.places[0].sheet})`).join(", ")}`);
   return lines.join("\n");
 }
