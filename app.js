@@ -74,11 +74,9 @@ const RECEIPT_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["store_name", "date", "currency", "items", "tax", "total", "source_ref", "picture_ids"],
+        required: ["store_name", "date", "currency", "items", "tax", "total"],
         properties: {
           store_name: { type: "string" },
-          source_ref: { type: "string", description: "Spreadsheets only: sheet and row, e.g. 'Sheet1 L12'. Empty string for photos/PDFs" },
-          picture_ids: { type: "array", items: { type: "string" }, description: "Spreadsheets only: the pictures (P1, P2…) that are this entry's invoice. Empty for photos/PDFs" },
           date: { ...nullable("string"), description: "Purchase date YYYY-MM-DD" },
           currency: { type: "string", description: "ISO 4217 code" },
           items: {
@@ -110,9 +108,47 @@ Rules:
 - Skip non-purchase lines (subtotals, payment, change, loyalty points, deposits returned).
 - date is the printed purchase date (YYYY-MM-DD), never today. Use null for anything not printed or not legible. Never invent values.
 - likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items (general groceries, cleaning products, fuel).
-- Spreadsheets (an expense list someone typed): each row that records an expense becomes one entry with a single line (unless the row clearly lists several), using the row's own date, description and amount. store_name is the merchant if a column gives it, otherwise a short description. source_ref is the sheet and row (e.g. "Sheet1 L12"). Skip headers, totals, subtotals, empty rows and side calculations or reference tables beside the list. tax and total are null unless the row has its own columns for them. Amounts may use a comma as decimal separator.
-- Spreadsheet pictures: scanned invoices or receipts pasted in the workbook appear as [picture P3] (in a cell, or at the end of the row where a floating picture starts, with the rows it covers). You only see where they are, not what they show. Put in picture_ids the pictures that are the invoice for that entry: a picture in the entry's row, or starting on it, belongs to it; a picture on its own row right below or beside an entry, or on another sheet, goes to the entry its caption or neighbouring cells match (store, date, amount, invoice number). One picture may back several entries and one entry may have several pictures. Leave out pictures you cannot tie to an entry, and never make an entry out of a picture alone.
 - If the file contains no receipt or expense, return an empty receipts array.`;
+
+/**
+ * Spreadsheets: the grid is the source. Every expense row of the grid gives exactly one line;
+ * an invoice picture is only attached to a row, it never creates, merges or splits lines.
+ */
+const SHEET_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["rows"],
+  properties: {
+    rows: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["sheet", "row", "date", "store_name", "description", "amount", "currency", "likely_for_children", "picture_ids"],
+        properties: {
+          sheet: { type: "string", description: "Sheet name, exactly as after '### Sheet:'" },
+          row: { type: "integer", description: "Row number N from the 'LN:' prefix" },
+          date: { ...nullable("string"), description: "The row's date YYYY-MM-DD" },
+          store_name: { type: "string", description: "Merchant if a column gives it, otherwise a short description" },
+          description: { type: "string", description: "Short item name from the row" },
+          amount: { type: "number", description: "The row's amount (negative for a refund or discount row)" },
+          currency: { type: "string", description: "ISO 4217 code" },
+          likely_for_children: { type: "string", enum: ["yes", "no", "unsure"] },
+          picture_ids: { type: "array", items: { type: "string" }, description: "Invoice pictures (P1, P2…) for this row; empty if none" },
+        },
+      },
+    },
+  },
+};
+
+const SHEET_PROMPT = `You read an expense list someone typed in a spreadsheet, for a parent who splits the children's expenses with the other parent. Each line of the grid is given as "LN: cell | cell | …" under "### Sheet: name".
+
+Rules:
+- Return exactly one entry per grid row that records an expense, in grid order: the row's own date, merchant, description and amount. Never merge several rows into one entry, never split one row into several, never skip an expense row.
+- Skip only rows that are not expenses: headers, totals, subtotals, empty rows, and side calculations or reference tables beside the list.
+- Amounts are plain numbers and may use a comma as decimal separator in the grid. date is YYYY-MM-DD or null; never invent values.
+- likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult; "unsure" for shared household items.
+- Invoice pictures pasted in the workbook appear as [picture P3] (in a cell, or at the end of the row where a floating picture starts, with the rows it covers). You only see where they are, not what they show. Pictures never create rows: they are only attached to a row when possible. In picture_ids put the pictures that are the invoice for that row: a picture in the row, or starting on it, belongs to it; a picture on another sheet or on its own row goes to the row its caption or neighbouring cells match (store, date, amount, invoice number). One picture may back several rows; a row may have none. When unsure, leave picture_ids empty.`;
 
 // ---------------------------------------------------------------------------
 // State
@@ -316,14 +352,14 @@ async function extract(client, file) {
   const kids = settings.kidsContext ? `\nAbout the children: ${settings.kidsContext}` : "";
   const params = {
     model: settings.model,
-    max_tokens: 16000,
-    system: SYSTEM_PROMPT,
-    output_config: { effort: "medium", format: { type: "json_schema", schema: RECEIPT_SCHEMA } },
+    max_tokens: wb ? 32000 : 16000,
+    system: wb ? SHEET_PROMPT : SYSTEM_PROMPT,
+    output_config: { effort: "medium", format: { type: "json_schema", schema: wb ? SHEET_SCHEMA : RECEIPT_SCHEMA } },
     messages: [{
       role: "user",
       content: [await fileSource(file, wb), {
         type: "text",
-        text: `${file.kind === "sheet" ? "Turn each expense row of this spreadsheet into an entry" : `Extract the receipt(s) in this ${file.kind === "pdf" ? "PDF" : "image"}`} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}`,
+        text: `${file.kind === "sheet" ? "Return one entry per expense row of this grid" : `Extract the receipt(s) in this ${file.kind === "pdf" ? "PDF" : "image"}`} (file name: "${file.name}"). If no currency is shown, assume ${settings.currency}.${kids}`,
       }],
     }],
   };
@@ -335,9 +371,38 @@ async function extract(client, file) {
   if (message.stop_reason === "refusal") throw new Error(t("e.refused"));
   if (message.stop_reason === "max_tokens") throw new Error(t("e.cutoff"));
   const text = message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-  let receipts;
-  try { receipts = JSON.parse(text).receipts || []; } catch { throw new Error(t("e.unreadable")); }
-  return { receipts, pictures: wb?.pictures || [] };
+  let data;
+  try { data = JSON.parse(text); } catch { throw new Error(t("e.unreadable")); }
+  if (!wb) return { receipts: data.receipts || [], pictures: [] };
+  return { receipts: rowsToEntries(wb.sheets, data.rows || []), pictures: wb.pictures };
+}
+
+/**
+ * One entry per grid row: rows that don't exist or are empty in the grid are dropped,
+ * a row returned twice is kept once, and entries follow the grid order.
+ */
+function rowsToEntries(sheets, rows) {
+  const order = new Map(sheets.map((s, i) => [s.name, i]));
+  const seen = new Set();
+  return rows
+    .filter((x) => {
+      const cells = sheets[order.get(x.sheet)]?.rows[x.row - 1];
+      const key = `${x.sheet}\u0000${x.row}`;
+      if (!cells?.some((v) => v != null && String(v).trim() !== "") || seen.has(key) || !Number.isFinite(x.amount)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => order.get(a.sheet) - order.get(b.sheet) || a.row - b.row)
+    .map((x) => ({
+      store_name: x.store_name || x.description,
+      date: x.date,
+      currency: x.currency,
+      source_ref: `${x.sheet} L${x.row}`,
+      picture_ids: x.picture_ids,
+      tax: null,
+      total: null,
+      items: [{ description: x.description || x.store_name, line_total: x.amount, likely_for_children: x.likely_for_children }],
+    }));
 }
 
 function describeError(err) {
