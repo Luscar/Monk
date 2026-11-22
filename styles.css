@@ -199,3 +199,14 @@ main > *, .card > * { min-width: 0; }
 .acct-row.sub { color: var(--muted); font-size: .9rem; }
 .acct-row.result { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 8px; font-size: 1.05rem; }
 .acct-row.result b { color: var(--accent); }
+
+/* Base / Particulière category on each kids' line, ratios by year in Settings */
+.tag.cat { min-width: 0; min-height: 24px; margin-top: 4px; font-size: .7rem; font-weight: 600; }
+.tag.cat.base { color: var(--muted); border-color: var(--border); }
+.tag.cat.special { color: #6941c6; border-color: currentColor; }
+@media (prefers-color-scheme: dark) { .tag.cat.special { color: #b692f6; } }
+.share-rows { display: grid; gap: 6px; }
+.share-row { display: flex; align-items: center; gap: 6px; }
+.field .share-row input { width: 96px; min-height: 40px; }
+.field .share-row span { color: var(--text); font-size: .9rem; }
+.field .hint { margin: 0; }
