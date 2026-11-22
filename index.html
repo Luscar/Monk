@@ -66,6 +66,7 @@
       <h2 data-i18n="list.title"></h2>
       <p class="hint" data-i18n="list.hint"></p>
       <p id="untagged" class="hint warn-text" hidden></p>
+      <p id="unlinkedPics" class="hint warn-text" hidden></p>
       <div id="receipts"></div>
     </section>
 
@@ -135,6 +136,16 @@
       </div>
       <hr>
       <button type="button" id="wipeBtn" class="btn ghost danger" data-i18n="wipe.btn"></button>
+    </form>
+  </dialog>
+
+  <dialog id="invoiceDialog">
+    <form method="dialog">
+      <h2 data-i18n="inv.title"></h2>
+      <p id="invoiceFor" class="meta"></p>
+      <p class="hint" data-i18n="inv.hint"></p>
+      <div id="invoiceGrid" class="pic-grid"></div>
+      <div class="row"><button value="close" class="btn primary" data-i18n="inv.done"></button></div>
     </form>
   </dialog>
 
