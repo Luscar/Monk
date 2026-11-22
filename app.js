@@ -169,11 +169,35 @@ async function loadState() {
   [files, receipts, seq] = await Promise.all([db.all("files"), db.all("receipts"), db.get("meta", "seq")]);
   seq ||= 0;
   for (const f of files) if (f.status === "working" || f.status === "queued") f.status = "pending";
+  await assignDocIds();
   receipts.sort((a, b) => a.id.localeCompare(b.id));
 }
 
 const saveFile = (f) => db.put("files", f);
 const saveReceipt = (r) => db.put("receipts", r);
+
+/**
+ * Invoices and receipt photos/PDFs get a short identifier like the lines (R-2026-0003):
+ * I-2026-001 ("I" for image), given once and kept, used in the report and as file name in the zip.
+ */
+const isProof = (f) => f.kind === "invoice" || f.kind === "image" || f.kind === "pdf";
+const docNum = (id) => Number((String(id || "").match(/^I-\d+-(\d+)$/) || [])[1] || 0);
+let docSeq = 0;
+function nextDocId(when = new Date()) {
+  docSeq += 1;
+  db.put("meta", docSeq, "docSeq");
+  return `I-${new Date(when).getFullYear()}-${String(docSeq).padStart(3, "0")}`;
+}
+/** Gives an identifier to proofs that have none yet (files from earlier versions or a restore). */
+async function assignDocIds() {
+  docSeq = Math.max((await db.get("meta", "docSeq")) || 0, docSeq, ...files.map((f) => docNum(f.docId)));
+  const todo = files.filter((f) => isProof(f) && !f.docId)
+    .sort((a, b) => (a.addedAt || "").localeCompare(b.addedAt || "") || (a.picKey || "").localeCompare(b.picKey || "", undefined, { numeric: true }));
+  for (const f of todo) {
+    f.docId = nextDocId(f.addedAt || Date.now());
+    await saveFile(f);
+  }
+}
 
 function nextReceiptId() {
   seq += 1;
@@ -287,6 +311,7 @@ async function addFiles(fileList) {
       receiptIds: [],
       payer: settings.intakePayer,
     };
+    if (isProof(rec)) rec.docId = nextDocId();
     files.push(rec);
     await saveFile(rec);
   }
@@ -499,6 +524,7 @@ async function saveInvoices(file, pictures) {
       receiptIds: [],
       payer: file.payer,
       picKey: p.key,
+      docId: nextDocId(),
       place,
       label: p.label,
       rows,
@@ -985,7 +1011,7 @@ function renderInvoiceDialog(r) {
     return h("div", { class: `pic ${on ? "on" : ""}` },
       h("button", { type: "button", class: "pic-img", "aria-label": t("inv.open", { place: inv.place }), onclick: () => openBlob(inv) },
         h("img", { src: thumbFor(inv), alt: "" })),
-      h("div", { class: "pic-meta" }, [inv.label, inv.picKey, inv.place, inv.invoiceDate].filter(Boolean).join(" · ")),
+      h("div", { class: "pic-meta" }, [inv.docId, inv.label, inv.place, inv.invoiceDate].filter(Boolean).join(" · ")),
       others.length ? h("div", { class: "pic-meta" }, t("inv.alsoOn", { refs: others.join(", ") })) : null,
       h("button", { type: "button", class: `btn small ${on ? "primary" : ""}`, "aria-pressed": String(on), onclick: () => toggleInvoice(r, inv) },
         t(on ? "inv.linked" : "inv.link")));
@@ -1008,32 +1034,19 @@ function proofsOf(r) {
   return f?.blob ? [f] : [];
 }
 
-/** "F-12" → "F-12"; anything unusable as a file name → "". */
-const docName = (s) => String(s ?? "").normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 40);
-
 /**
  * Builds the report for the chosen period. docs: every proof of a kids' line, once per content
- * (same SHA-256 = same invoice). Each gets a short readable identifier, used both in the report
- * and as its file name in the zip: the identifier written above the picture in the workbook
- * (F-12), else FAC-001, FAC-002… in report order. The SHA-256 stays alongside, for checking.
+ * (same SHA-256 = same invoice), under its identifier (I-2026-001), which is also its file name
+ * in the zip. The SHA-256 is only in the zip's checksum file.
  */
 async function buildReport() {
   const list = shownReceipts().filter(inPeriod).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const docs = new Map();
-  const usedIds = new Set();
-  let seqNo = 0;
   const docsOf = async (r) => {
     const out = [];
     for (const f of proofsOf(r)) {
       const sha256 = await sha256Hex(f.blob);
-      if (!docs.has(sha256)) {
-        let id = f.kind === "invoice" ? docName(f.label) : "";
-        if (!id || usedIds.has(id.toLowerCase())) {
-          do id = `${t("doc.prefix")}-${String(++seqNo).padStart(3, "0")}`; while (usedIds.has(id.toLowerCase()));
-        }
-        usedIds.add(id.toLowerCase());
-        docs.set(sha256, { id, name: `${id}${extOf(f)}`, blob: f.blob, sha256 });
-      }
+      if (!docs.has(sha256)) docs.set(sha256, { id: f.docId || f.id, name: `${f.docId || f.id}${extOf(f)}`, blob: f.blob });
       if (!out.includes(docs.get(sha256))) out.push(docs.get(sha256));
     }
     return out;
@@ -1047,7 +1060,7 @@ async function buildReport() {
       const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
         Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r),
-        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.id).join(", "), proofs.map((d) => d.sha256).join(", ")]);
+        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.id).join(", ")]);
     }
   }
   const { rows } = account(list);
@@ -1071,7 +1084,7 @@ async function buildReport() {
   }
   const xlsx = await makeXlsx([
     { name: t("xl.account"), rows: summary, money: [1], widths: { 0: 44, 1: 20 } },
-    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 12: 36, 13: 16, 14: 66 } },
+    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 12: 36, 13: 16 } },
   ]);
   return { xlsx, docs: [...docs.values()] };
 }
@@ -1142,6 +1155,7 @@ async function restore(zipFile) {
     await saveReceipt(r);
     nr += 1;
   }
+  await assignDocIds();
   const maxId = Math.max(seq, data.seq || 0, ...receipts.map((r) => Number((r.id.match(/^R-\d+-(\d+)$/) || [])[1] || 0)));
   if (maxId !== seq) { seq = maxId; await db.put("meta", seq, "seq"); }
   receipts.sort((a, b) => a.id.localeCompare(b.id));
@@ -1227,7 +1241,7 @@ function renderReceipt(r) {
     h("header", {},
       h("div", {},
         h("h3", {}, r.store_name || t("unknownStore")),
-        h("div", { class: "meta" }, [r.date ? `${r.date}${r.dateFrom === "invoice" ? ` (${t("date.fromInvoice")})` : ""}` : t("noDate"), r.id, r.source_ref].filter(Boolean).join(" · "))),
+        h("div", { class: "meta" }, [r.date ? `${r.date}${r.dateFrom === "invoice" ? ` (${t("date.fromInvoice")})` : ""}` : t("noDate"), r.id, r.source_ref, !r.source_ref && files.find((f) => f.id === r.fileId)?.docId].filter(Boolean).join(" · "))),
       h("button", {
         class: `badge-btn ${r.payer === "other" ? "other" : ""}`,
         onclick: () => update(r, () => { r.payer = r.payer === "other" ? "me" : "other"; }),
@@ -1240,8 +1254,8 @@ function renderReceipt(r) {
           r.tax != null && h("tr", {}, h("td", {}), h("td", {}, t("tax")), h("td", { class: "num" }, fmtNum(r.tax))),
           h("tr", { class: "grand" }, h("td", {}), h("td", {}, t("total")), h("td", { class: "num" }, fmtMoney(a.total, c)))))),
     invoices.length ? h("div", { class: "invoices" },
-      h("span", { class: "meta" }, t("inv.label")),
-      invoices.map((inv) => h("button", { class: "inv-thumb", "aria-label": t("inv.open", { place: inv.place }), title: inv.place, onclick: () => openBlob(inv) },
+      h("span", { class: "meta" }, `${t("inv.label")} ${invoices.map((inv) => inv.docId).filter(Boolean).join(", ")}`),
+      invoices.map((inv) => h("button", { class: "inv-thumb", "aria-label": t("inv.open", { place: inv.place }), title: [inv.docId, inv.place].filter(Boolean).join(" · "), onclick: () => openBlob(inv) },
         h("img", { src: thumbFor(inv), alt: "" })))) : null,
     h("div", { class: "actions" },
       h("button", { class: "btn small", onclick: () => viewOriginal(r) }, t(r.source_ref ? "btn.viewSheet" : "btn.view")),
