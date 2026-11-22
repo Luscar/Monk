@@ -529,6 +529,7 @@ async function processAll() {
         const { receipts: extracted, pictures } = await extract(client, file);
         const byKey = await saveInvoices(file, pictures);
         file.receiptIds = await createReceipts(file, extracted, byKey);
+        await fillDatesFromInvoices(client, receipts.filter((r) => file.receiptIds.includes(r.id)));
         file.status = "done";
         if (!extracted.length) toast(t("t.noReceipt", { name: file.name }), 4000);
       } catch (err) {
@@ -545,6 +546,90 @@ async function processAll() {
   render();
   const failed = todo.filter((f) => f.status === "error").length;
   toast(failed ? t("t.failed", { n: failed }) : t("t.done"));
+}
+
+// ---------------------------------------------------------------------------
+// Dates of Excel lines that have none: read from their linked invoice pictures
+// ---------------------------------------------------------------------------
+const INVOICE_DATE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["dates"],
+  properties: {
+    dates: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["picture", "date"],
+        properties: {
+          picture: { type: "string", description: "The label given before the image, e.g. P3" },
+          date: { ...nullable("string"), description: "Printed invoice/purchase date YYYY-MM-DD, or null" },
+        },
+      },
+    },
+  },
+};
+
+const INVOICE_DATE_PROMPT = `Each image is an invoice or receipt, introduced by its label (P1, P2…). For each one, return the purchase or invoice date printed on it as YYYY-MM-DD. Use null when no date is printed or legible, or when the image is not an invoice or receipt. Never use today's date and never guess. For a numeric date such as 03/04/2026, follow the convention of the invoice's country and language (day/month for French-language or Canadian-French invoices, unless the layout clearly shows otherwise).`;
+
+const DATE_BATCH = 8;
+
+/** Reads the printed date of invoice pictures not read yet; stores it on each (string, or null when none). */
+async function readInvoiceDates(client, invoices) {
+  const todo = invoices.filter((f) => f.invoiceDate === undefined && f.blob);
+  for (let i = 0; i < todo.length; i += DATE_BATCH) {
+    const batch = todo.slice(i, i + DATE_BATCH);
+    const content = [];
+    for (const f of batch) {
+      const img = await prepareImage(f.blob, f.type);
+      content.push({ type: "text", text: `Picture ${f.picKey}:` }, { type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } });
+    }
+    content.push({ type: "text", text: "Return the printed date of each picture." });
+    const params = {
+      model: settings.model,
+      max_tokens: 4000,
+      system: INVOICE_DATE_PROMPT,
+      output_config: { effort: "low", format: { type: "json_schema", schema: INVOICE_DATE_SCHEMA } },
+      messages: [{ role: "user", content }],
+    };
+    if (FALLBACK_MODELS.has(params.model)) {
+      params.betas = ["server-side-fallback-2026-07-01"];
+      params.fallbacks = "default";
+    }
+    const message = await client.beta.messages.stream(params).finalMessage();
+    if (message.stop_reason !== "end_turn") continue;
+    let dates = [];
+    try { dates = JSON.parse(message.content.filter((b) => b.type === "text").map((b) => b.text).join("")).dates || []; } catch { continue; }
+    for (const f of batch) {
+      const d = dates.find((x) => String(x.picture).trim().toUpperCase() === f.picKey)?.date;
+      f.invoiceDate = /^\d{4}-\d{2}-\d{2}$/.test(d || "") ? d : null;
+      await saveFile(f);
+    }
+  }
+}
+
+/** Gives a dateless entry the date of its first linked invoice that has one. Returns true if it changed. */
+function applyInvoiceDate(r) {
+  if (r.date) return false;
+  const d = invoicesOf(r).map((f) => f.invoiceDate).find(Boolean);
+  if (!d) return false;
+  r.date = d;
+  r.dateFrom = "invoice";
+  return true;
+}
+
+/** For Excel lines without a date: read their linked invoices (only those) and copy the date. */
+async function fillDatesFromInvoices(client, list) {
+  const dateless = list.filter((r) => !r.date && r.invoiceIds?.length);
+  if (!dateless.length) return;
+  try {
+    await readInvoiceDates(client, [...new Set(dateless.flatMap(invoicesOf))]);
+  } catch (err) {
+    console.error(err);
+    toast(t("t.dateFailed", { msg: describeError(err) }), 5000);
+  }
+  for (const r of dateless) if (applyInvoiceDate(r)) await saveReceipt(r);
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +745,7 @@ async function editReceipt(r) {
   if (total == null) return;
   await update(r, () => {
     r.store_name = store_name.trim() || r.store_name;
-    r.date = /^\d{4}-\d{2}-\d{2}$/.test(date.trim()) ? date.trim() : r.date;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(date.trim()) && date.trim() !== r.date) { r.date = date.trim(); delete r.dateFrom; }
     if (total.trim() === "") r.total = null;
     else if (Number.isFinite(parseAmount(total))) r.total = parseAmount(total);
   });
@@ -702,9 +787,23 @@ async function toggleInvoice(r, inv) {
   const linked = (r.invoiceIds || []).includes(inv.id);
   r.invoiceIds = linked ? r.invoiceIds.filter((id) => id !== inv.id) : [...(r.invoiceIds || []), inv.id];
   inv.receiptIds = linked ? inv.receiptIds.filter((id) => id !== r.id) : [...inv.receiptIds, r.id];
+  if (linked && r.dateFrom === "invoice" && inv.invoiceDate === r.date && !applyOtherDate(r)) { r.date = null; delete r.dateFrom; }
   await Promise.all([saveReceipt(r), saveFile(inv)]);
   render();
   renderInvoiceDialog(r);
+  if (!linked && !r.date && settings.apiKey) {
+    const client = new Anthropic({ apiKey: settings.apiKey, dangerouslyAllowBrowser: true, maxRetries: 3 });
+    await fillDatesFromInvoices(client, [r]);
+    render();
+    renderInvoiceDialog(r);
+  }
+}
+
+/** After unlinking the invoice a date came from: take another linked invoice's date, if any. */
+function applyOtherDate(r) {
+  const d = invoicesOf(r).map((f) => f.invoiceDate).find(Boolean);
+  if (d) r.date = d;
+  return !!d;
 }
 
 let invoiceDialogFor = null;
@@ -723,7 +822,7 @@ function renderInvoiceDialog(r) {
     return h("div", { class: `pic ${on ? "on" : ""}` },
       h("button", { type: "button", class: "pic-img", "aria-label": t("inv.open", { place: inv.place }), onclick: () => openBlob(inv) },
         h("img", { src: thumbFor(inv), alt: "" })),
-      h("div", { class: "pic-meta" }, `${inv.picKey} · ${inv.place}`),
+      h("div", { class: "pic-meta" }, [inv.picKey, inv.place, inv.invoiceDate].filter(Boolean).join(" · ")),
       others.length ? h("div", { class: "pic-meta" }, t("inv.alsoOn", { refs: others.join(", ") })) : null,
       h("button", { type: "button", class: `btn small ${on ? "primary" : ""}`, "aria-pressed": String(on), onclick: () => toggleInvoice(r, inv) },
         t(on ? "inv.linked" : "inv.link")));
@@ -735,16 +834,46 @@ function renderInvoiceDialog(r) {
 // ---------------------------------------------------------------------------
 const payerLabel = (r) => t(r.payer === "other" ? "payer.other" : "payer.me");
 
-async function exportXlsx() {
+/** File-name-safe text that keeps accents (the ZIP stores UTF-8 names). */
+const docName = (s) => String(s).normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+const extOf = (f) => (f.name.match(/\.[a-z0-9]+$/i) || [""])[0].toLowerCase()
+  || { "application/pdf": ".pdf", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" }[f.type] || ".jpg";
+
+/** The proof of an entry: invoice pictures linked to an Excel line, else the photo/PDF it was read from. */
+function proofsOf(r) {
+  if (r.source_ref) return invoicesOf(r);
+  const f = files.find((x) => x.id === r.fileId);
+  return f?.blob ? [f] : [];
+}
+
+/**
+ * Builds the report for the chosen period. docs: every proof of a kids' line, named after the first
+ * line it backs (R-2026-0003_Dépenses-E3.png), with its SHA-256 computed from the stored file.
+ */
+async function buildReport() {
   const list = shownReceipts().filter(inPeriod).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const docs = new Map();
+  const docsOf = async (r) => {
+    const out = [];
+    for (const f of proofsOf(r)) {
+      if (!docs.has(f.id)) {
+        const label = f.kind === "invoice" ? f.place : f.name.replace(/\.[a-z0-9]+$/i, "");
+        docs.set(f.id, { name: `${r.id}_${docName(label) || f.kind}${extOf(f)}`, blob: f.blob, sha256: await sha256Hex(f.blob) });
+      }
+      out.push(docs.get(f.id));
+    }
+    return out;
+  };
   const lines = [t("xl.hdr")];
   for (const r of list) {
-    for (const it of allocation(r).lines) {
-      if (!it.kids) continue;
+    const kidsLines = allocation(r).lines.filter((it) => it.kids);
+    if (!kidsLines.length) continue;
+    const proofs = await docsOf(r);
+    for (const it of kidsLines) {
       const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
         Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r),
-        [r.source, r.source_ref].filter(Boolean).join(" · "), invoicesOf(r).map((f) => f.place).join(", ")]);
+        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.name).join(", "), proofs.map((d) => d.sha256).join(", ")]);
     }
   }
   const { rows } = account(list);
@@ -766,11 +895,33 @@ async function exportXlsx() {
       [],
     );
   }
-  const blob = await makeXlsx([
+  const xlsx = await makeXlsx([
     { name: t("xl.account"), rows: summary, money: [1], widths: { 0: 44, 1: 20 } },
-    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14 } },
+    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 13: 36, 14: 66 } },
   ]);
-  await shareOrDownload(new File([blob], `${t("xl.file")}-${new Date().toISOString().slice(0, 10)}.xlsx`, { type: blob.type }));
+  return { xlsx, docs: [...docs.values()] };
+}
+
+const reportBase = () => `${t("xl.file")}-${new Date().toISOString().slice(0, 10)}`;
+
+async function exportXlsx() {
+  const { xlsx } = await buildReport();
+  await shareOrDownload(new File([xlsx], `${reportBase()}.xlsx`, { type: xlsx.type }));
+}
+
+/**
+ * Separate .zip: the report, the invoices of the kids' lines and a checksum list in
+ * sha256sum format (check with `sha256sum -c` / `shasum -a 256 -c`).
+ */
+async function exportReportZip() {
+  const { xlsx, docs } = await buildReport();
+  const base = reportBase();
+  const dir = t("zip.dir");
+  const entries = [{ name: `${base}.xlsx`, data: xlsx }, ...docs.map((d) => ({ name: `${dir}/${d.name}`, data: d.blob }))];
+  const sums = await Promise.all(entries.map(async (e) => `${await sha256Hex(e.data)}  ${e.name}`));
+  entries.push({ name: t("zip.sums"), data: `${sums.join("\n")}\n` });
+  const zip = await makeZip(entries);
+  await shareOrDownload(new File([zip], `${base}.zip`, { type: "application/zip" }));
 }
 
 const safeName = (s) => s.replace(/[^\w.\- ]+/g, "_").slice(0, 80);
@@ -902,7 +1053,7 @@ function renderReceipt(r) {
     h("header", {},
       h("div", {},
         h("h3", {}, r.store_name || t("unknownStore")),
-        h("div", { class: "meta" }, [r.date || t("noDate"), r.id, r.source_ref].filter(Boolean).join(" · "))),
+        h("div", { class: "meta" }, [r.date ? `${r.date}${r.dateFrom === "invoice" ? ` (${t("date.fromInvoice")})` : ""}` : t("noDate"), r.id, r.source_ref].filter(Boolean).join(" · "))),
       h("button", {
         class: `badge-btn ${r.payer === "other" ? "other" : ""}`,
         onclick: () => update(r, () => { r.payer = r.payer === "other" ? "me" : "other"; }),
@@ -1056,6 +1207,7 @@ $("#processBtn").addEventListener("click", processAll);
 $("#periodFrom").addEventListener("change", renderAccount);
 $("#periodTo").addEventListener("change", renderAccount);
 $("#exportBtn").addEventListener("click", () => exportXlsx().catch((err) => { console.error(err); toast(err.message); }));
+$("#reportZipBtn").addEventListener("click", () => exportReportZip().catch((err) => { console.error(err); toast(err.message); }));
 
 if ("launchQueue" in window) {
   window.launchQueue.setConsumer(async (params) => {
