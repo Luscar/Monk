@@ -169,7 +169,7 @@ export async function readWorkbook(blob) {
         const vm = c.getAttribute("vm");
         const pic = vm && inCell(Number(vm)) ? picture(inCell(Number(vm))) : null;
         if (pic) {
-          pic.places.push({ sheet: name, row: r, rowEnd: r, col: i, inCell: true });
+          pic.places.push({ sheet: name, row: r, rowEnd: r, col: i, colEnd: i, inCell: true });
           val = `[picture ${pic.key}]`;
         } else if (tp === "s") val = shared[Number(v)] ?? "";
         else if (tp === "inlineStr") val = textOf(all(c, "is")[0]);
@@ -203,19 +203,41 @@ export async function readWorkbook(blob) {
         // one that ends exactly at the top of a row doesn't cover that row.
         if (row != null && rowEnd > row && at("from", "rowOff") > (heights.get(row) ?? defaultHt) * EMU_PER_PT / 2) row += 1;
         if (rowEnd > row && at("to", "rowOff") === 0) rowEnd -= 1;
-        const place = { sheet: name, row, rowEnd, col: at("from", "col"), inCell: false };
+        const place = { sheet: name, row, rowEnd, col: at("from", "col"), colEnd: at("to", "col") ?? at("from", "col"), inCell: false };
         for (const blip of all(a, "blip")) {
           const pic = picture(media.get(blip.getAttributeNS(REL_NS, "embed") || blip.getAttribute("r:embed")) || "");
           if (pic && !pic.places.some((p) => p.sheet === name && p.row === row && p.col === place.col)) pic.places.push(place);
         }
       }
     }
-    sheets.push({ name, rows: rows.map((r) => r || []) });
+    sheets.push({ name, rows: Array.from(rows, (r) => r || []) });
   }
 
   const list = [...pictures.values()].filter((p) => p.places.length);
-  for (const p of list) p.blob = await zip.blob(p.path, p.type);
+  for (const p of list) {
+    p.blob = await zip.blob(p.path, p.type);
+    for (const pl of p.places) pl.label = labelAbove(sheets.find((s) => s.name === pl.sheet), pl);
+    p.label = p.places.map((pl) => pl.label).find(Boolean) || null;
+  }
   return { sheets, pictures: list };
+}
+
+/**
+ * The identifier written just above a picture (e.g. "F-12"), reused in the expense rows to point
+ * at their invoice: the first text found in the picture's columns, up to 3 rows above it.
+ */
+function labelAbove(sheet, pl) {
+  if (!sheet || pl.row == null) return null;
+  for (let r = pl.row - 1; r >= Math.max(0, pl.row - 3); r--) {
+    const cells = sheet.rows[r] || [];
+    for (let c = pl.col ?? 0; c <= (pl.colEnd ?? pl.col ?? 0); c++) {
+      const v = cells[c];
+      if (v == null || String(v).trim() === "" || /^\[picture P\d+\]$/.test(String(v))) continue;
+      const text = String(v).replace(/\s+/g, " ").trim();
+      return text.length <= 40 ? text : null;
+    }
+  }
+  return null;
 }
 
 /**
@@ -286,7 +308,7 @@ export function sheetsToText(sheets, pictures = [], maxRows = 1500) {
         if (pl.sheet !== s.name || pl.inCell || pl.row == null) continue;
         const span = pl.rowEnd > pl.row ? `, covers L${pl.row + 1}–L${pl.rowEnd + 1}` : "";
         if (!floating.has(pl.row)) floating.set(pl.row, []);
-        floating.get(pl.row).push(`[picture ${p.key} at ${cellName(pl.col, pl.row)}${span}]`);
+        floating.get(pl.row).push(`[picture ${p.key} at ${cellName(pl.col, pl.row)}${span}${pl.label ? `, labelled "${pl.label}" above` : ""}]`);
       }
     }
     const rows = s.rows.map((r, i) => [i + 1, r])

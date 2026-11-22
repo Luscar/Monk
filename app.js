@@ -148,7 +148,7 @@ Rules:
 - Skip only rows that are not expenses: headers, totals, subtotals, empty rows, and side calculations or reference tables beside the list.
 - Amounts are plain numbers and may use a comma as decimal separator in the grid. date is YYYY-MM-DD or null; never invent values.
 - likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult; "unsure" for shared household items.
-- Invoice pictures pasted in the workbook appear as [picture P3] (in a cell, or at the end of the row where a floating picture starts, with the rows it covers). You only see where they are, not what they show. Pictures never create rows: they are only attached to a row when possible. In picture_ids put the pictures that are the invoice for that row: a picture in the row, or starting on it, belongs to it; a picture on another sheet or on its own row goes to the row its caption or neighbouring cells match (store, date, amount, invoice number). One picture may back several rows; a row may have none. When unsure, leave picture_ids empty.`;
+- Invoice pictures pasted in the workbook appear as [picture P3] (in a cell, or at the end of the row where a floating picture starts, with the rows it covers). You only see where they are, not what they show. Pictures never create rows: they are only attached to a row when possible. In picture_ids put the pictures that are the invoice for that row: a picture in the row, or starting on it, belongs to it; a picture "labelled" with an identifier above it goes to every row that has that identifier in a cell; a picture on another sheet or on its own row goes to the row its caption or neighbouring cells match (store, date, amount, invoice number). One picture may back several rows; a row may have none. When unsure, leave picture_ids empty.`;
 
 // ---------------------------------------------------------------------------
 // State
@@ -374,7 +374,7 @@ async function extract(client, file) {
   let data;
   try { data = JSON.parse(text); } catch { throw new Error(t("e.unreadable")); }
   if (!wb) return { receipts: data.receipts || [], pictures: [] };
-  return { receipts: rowsToEntries(wb.sheets, data.rows || []), pictures: wb.pictures };
+  return { receipts: linkByLabel(wb.sheets, rowsToEntries(wb.sheets, data.rows || []), wb.pictures), pictures: wb.pictures };
 }
 
 /**
@@ -403,6 +403,49 @@ function rowsToEntries(sheets, rows) {
       total: null,
       items: [{ description: x.description || x.store_name, line_total: x.amount, likely_for_children: x.likely_for_children }],
     }));
+}
+
+/** "F-003" and "f 3" are the same identifier. */
+const normId = (v) => String(v ?? "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+  .replace(/[^a-z0-9]+/g, " ").trim().replace(/(^|\D|\s)0+(\d)/g, "$1$2").replace(/\s+/g, "");
+
+/**
+ * Identifier above each picture, reused in the rows: a row whose cell holds a picture's label
+ * (alone, or in a list such as "F3, F4") gets that picture. Labels made only of digits could be
+ * mistaken for amounts, so they only count in the column where labels match most rows.
+ */
+function linkByLabel(sheets, entries, pictures) {
+  const byLabel = new Map();
+  for (const p of pictures) {
+    for (const label of new Set(p.places.map((pl) => pl.label).filter(Boolean))) {
+      const k = normId(label);
+      if (!k) continue;
+      if (!byLabel.has(k)) byLabel.set(k, new Set());
+      byLabel.get(k).add(p.key);
+    }
+  }
+  if (!byLabel.size) return entries;
+  const hits = [];
+  for (const [i, x] of entries.entries()) {
+    const ref = parseRef(x.source_ref);
+    const cells = sheets.find((s) => s.name === ref?.sheet)?.rows[ref.row - 1] || [];
+    cells.forEach((v, col) => {
+      if (v == null || typeof v === "number" && !Number.isInteger(v)) return;
+      for (const part of [String(v), ...String(v).split(/[,;/+&]|\s(?:et|and)\s/i)]) {
+        const keys = byLabel.get(normId(part));
+        if (keys) hits.push({ i, col, keys, numeric: /^\d+$/.test(normId(part)) });
+      }
+    });
+  }
+  const perCol = new Map();
+  for (const h of hits) perCol.set(h.col, (perCol.get(h.col) || new Set()).add(h.i));
+  const best = [...perCol].sort((a, b) => b[1].size - a[1].size)[0]?.[0];
+  for (const h of hits) {
+    if (h.numeric && h.col !== best) continue;
+    const x = entries[h.i];
+    x.picture_ids = [...new Set([...(x.picture_ids || []), ...h.keys])];
+  }
+  return entries;
 }
 
 function describeError(err) {
@@ -457,6 +500,7 @@ async function saveInvoices(file, pictures) {
       payer: file.payer,
       picKey: p.key,
       place,
+      label: p.label,
       rows,
     };
     files.push(rec);
@@ -699,7 +743,7 @@ async function matchByContent(client, list, invoices) {
     const known = invoices.filter((f) => f.invoiceInfo);
     if (!known.length) return;
     const lines = missing.map((r) => ({ line: r.source_ref, date: r.date, store: r.store_name, description: r.items?.[0]?.description, amount: r.items?.[0]?.line_total, currency: r.currency }));
-    const pics = known.map((f) => ({ picture: f.picKey, place: f.place, ...f.invoiceInfo, already_linked_to: f.receiptIds.map((id) => receipts.find((r) => r.id === id)?.source_ref).filter(Boolean) }));
+    const pics = known.map((f) => ({ picture: f.picKey, place: f.place, label_above: f.label, ...f.invoiceInfo, already_linked_to: f.receiptIds.map((id) => receipts.find((r) => r.id === id)?.source_ref).filter(Boolean) }));
     const message = await client.beta.messages.stream(withFallback({
       model: settings.model,
       max_tokens: 16000,
@@ -941,7 +985,7 @@ function renderInvoiceDialog(r) {
     return h("div", { class: `pic ${on ? "on" : ""}` },
       h("button", { type: "button", class: "pic-img", "aria-label": t("inv.open", { place: inv.place }), onclick: () => openBlob(inv) },
         h("img", { src: thumbFor(inv), alt: "" })),
-      h("div", { class: "pic-meta" }, [inv.picKey, inv.place, inv.invoiceDate].filter(Boolean).join(" · ")),
+      h("div", { class: "pic-meta" }, [inv.label, inv.picKey, inv.place, inv.invoiceDate].filter(Boolean).join(" · ")),
       others.length ? h("div", { class: "pic-meta" }, t("inv.alsoOn", { refs: others.join(", ") })) : null,
       h("button", { type: "button", class: `btn small ${on ? "primary" : ""}`, "aria-pressed": String(on), onclick: () => toggleInvoice(r, inv) },
         t(on ? "inv.linked" : "inv.link")));
