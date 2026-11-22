@@ -67,8 +67,22 @@ const nullable = (type) => ({ anyOf: [{ type }, { type: "null" }] });
 const RECEIPT_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["receipts"],
+  required: ["receipts", "prorata_rates"],
   properties: {
+    prorata_rates: {
+      type: "array",
+      description: "Spreadsheets only: prorata (income ratio) table by year, one entry per year and parent. Empty array otherwise",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["year", "parent", "percent"],
+        properties: {
+          year: { type: "string", description: "YYYY" },
+          parent: { type: "string", description: "Parent label as written (name, 'Père', 'Mère', 'Parent 1'…); empty string if the table gives one percentage without saying whose" },
+          percent: { type: "number", description: "0–100" },
+        },
+      },
+    },
     receipts: {
       type: "array",
       items: {
@@ -85,11 +99,13 @@ const RECEIPT_SCHEMA = {
             items: {
               type: "object",
               additionalProperties: false,
-              required: ["description", "line_total", "likely_for_children"],
+              required: ["description", "line_total", "likely_for_children", "share_type", "prorata_year"],
               properties: {
                 description: { type: "string", description: "Short item name" },
                 line_total: { type: "number", description: "Amount paid for the line; discounts are negative lines" },
                 likely_for_children: { type: "string", enum: ["yes", "no", "unsure"] },
+                share_type: { type: "string", enum: ["base", "special", "unknown"] },
+                prorata_year: { type: "string", description: "YYYY of the prorata that applies, when the file says; else empty string" },
               },
             },
           },
@@ -110,6 +126,9 @@ Rules:
 - date is the printed purchase date (YYYY-MM-DD), never today. Use null for anything not printed or not legible. Never invent values.
 - likely_for_children: "yes" when clearly for a child (kids' clothing/shoes, diapers, baby food, toys, school supplies, children's medicine, kids' activities or meals); "no" when clearly for an adult (alcohol, tobacco, adult clothing, adult toiletries, car parts); "unsure" for shared household items (general groceries, cleaning products, fuel).
 - Spreadsheets (an expense list someone typed): each row that records an expense becomes one entry with a single line (unless the row clearly lists several), using the row's own date, description and amount. store_name is the merchant if a column gives it, otherwise a short description. source_ref is the sheet and row (e.g. "Sheet1 L12"). Skip headers, totals, subtotals, empty rows and side calculations or reference tables beside the list. tax and total are null unless the row has its own columns for them. Amounts may use a comma as decimal separator.
+- share_type: how the parents share the line. Spreadsheets: "special" when the row or a column marks it as shared by prorata / income ratio (e.g. "Particulière", "Spéciale", "Extraordinaire", "Prorata", a prorata year, or a percentage other than 50/50); "base" when marked as a base / 50-50 expense; "unknown" when the file does not say. Always "unknown" for photos and PDFs.
+- prorata_year: when a column (or the row) gives the year whose prorata applies to that expense, that year as YYYY (it can differ from the purchase date). Otherwise an empty string.
+- prorata_rates: if the spreadsheet holds a table of prorata / ratio values by year (often on its own sheet), list each year and each parent's percentage as written, with the parent's label as written. Convert fractions to percentages (0.6 → 60). Follow formulas only through their shown values. Empty array if there is no such table, and always for photos and PDFs.
 - If the file contains no receipt or expense, return an empty receipts array.`;
 
 // ---------------------------------------------------------------------------
@@ -319,7 +338,10 @@ async function extract(client, file) {
   if (message.stop_reason === "refusal") throw new Error(t("e.refused"));
   if (message.stop_reason === "max_tokens") throw new Error(t("e.cutoff"));
   const text = message.content.filter((b) => b.type === "text").map((b) => b.text).join("");
-  try { return JSON.parse(text).receipts || []; } catch { throw new Error(t("e.unreadable")); }
+  try {
+    const out = JSON.parse(text);
+    return { receipts: out.receipts || [], rates: out.prorata_rates || [] };
+  } catch { throw new Error(t("e.unreadable")); }
 }
 
 function describeError(err) {
@@ -352,7 +374,8 @@ async function createReceipts(file, extracted) {
         ai_suggestion: it.likely_for_children,
         alloc: SUGGESTION_TO_ALLOC[it.likely_for_children] || "review",
         split_pct: DEFAULT_SPLIT,
-        cat: "base",
+        cat: it.share_type === "special" ? "special" : "base",
+        ...(/^\d{4}$/.test(it.prorata_year || "") ? { ratio_year: it.prorata_year } : {}),
       })),
     };
     receipts.push(r);
@@ -372,13 +395,15 @@ async function processAll() {
   render();
 
   const queue = [...todo];
+  const rates = [];
   const worker = async () => {
     while (queue.length) {
       const file = queue.shift();
       file.status = "working";
       render();
       try {
-        const extracted = await extract(client, file);
+        const { receipts: extracted, rates: found } = await extract(client, file);
+        rates.push(...found);
         file.receiptIds = await createReceipts(file, extracted);
         file.status = "done";
         if (!extracted.length) toast(t("t.noReceipt", { name: file.name }), 4000);
@@ -396,6 +421,59 @@ async function processAll() {
   render();
   const failed = todo.filter((f) => f.status === "error").length;
   toast(failed ? t("t.failed", { n: failed }) : t("t.done"));
+  if (rates.length) offerRates(rates);
+}
+
+// ---------------------------------------------------------------------------
+// Prorata table found in a spreadsheet → ratios by year in Settings
+// ---------------------------------------------------------------------------
+/** Asks which parent of the file's prorata table is "me", then saves the ratios by year. */
+function offerRates(found) {
+  const byYear = {};
+  for (const x of found) {
+    if (!/^\d{4}$/.test(String(x.year).trim()) || !Number.isFinite(x.percent)) continue;
+    const p = x.percent > 0 && x.percent <= 1 ? x.percent * 100 : x.percent;
+    if (p < 0 || p > 100) continue;
+    (byYear[String(x.year).trim()] ??= {})[String(x.parent || "").trim()] = round2(p);
+  }
+  const years = Object.keys(byYear).sort();
+  if (!years.length) return;
+  const labels = [...new Set(years.flatMap((y) => Object.keys(byYear[y])))];
+  const name = (l) => l || t("rate.unnamed");
+  const current = settings.specialShares;
+
+  /** My % for each year, given my label (or, with other=true, the other parent's label). */
+  const mine = (label, other = false) => {
+    const out = {};
+    for (const y of years) {
+      const row = byYear[y];
+      const others = Object.entries(row).filter(([l]) => l !== label);
+      let p = row[label] ?? (others.length === 1 ? 100 - others[0][1] : null);
+      if (p != null && other) p = 100 - p;
+      if (p != null) out[y] = round2(p);
+    }
+    return out;
+  };
+
+  const apply = (shares) => {
+    const merged = { ...settings.specialShares, ...shares };
+    store.set("specialShares", JSON.stringify(merged));
+    $("#prorataDialog").close();
+    toast(t("rate.saved", { y: Object.keys(shares).join(", ") }), 4000);
+    render();
+  };
+
+  $("#prorataTable").replaceChildren(h("table", {},
+    h("thead", {}, h("tr", {}, h("th", {}, t("set.year")), ...labels.map((l) => h("th", { class: "num" }, name(l))), h("th", { class: "num" }, t("rate.current")))),
+    h("tbody", {}, years.map((y) => h("tr", {},
+      h("td", {}, y),
+      ...labels.map((l) => h("td", { class: "num" }, byYear[y][l] != null ? `${fmtNum(byYear[y][l])} %` : "—")),
+      h("td", { class: "num" }, current[y] != null ? `${fmtNum(current[y])} %` : "—"))))));
+  $("#prorataChoices").replaceChildren(
+    ...labels.map((l) => h("button", { type: "button", class: "btn primary", onclick: () => apply(mine(l)) }, t("rate.iAm", { n: name(l) }))),
+    ...(labels.length === 1 ? [h("button", { type: "button", class: "btn", onclick: () => apply(mine(labels[0], true)) }, t("rate.isOther", { n: name(labels[0]) }))] : []),
+  );
+  $("#prorataDialog").showModal();
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +483,7 @@ async function processAll() {
 function effectiveItems(r) {
   let prev = null;
   return (r.items || []).map((it) => {
-    if ((it.line_total || 0) < 0 && prev) return { ...it, alloc: prev.alloc, split_pct: prev.split_pct, cat: prev.cat, linked: true };
+    if ((it.line_total || 0) < 0 && prev) return { ...it, alloc: prev.alloc, split_pct: prev.split_pct, cat: prev.cat, ratio_year: prev.ratio_year, linked: true };
     if ((it.line_total || 0) >= 0) prev = it;
     return it;
   });
@@ -443,6 +521,8 @@ function inPeriod(r) {
 
 const isSpecial = (it) => it.cat === "special";
 const yearOf = (r) => (r.date || "").slice(0, 4) || String(new Date().getFullYear());
+/** Year whose prorata applies: the one given for the line (e.g. a spreadsheet column), else the purchase year. */
+const ratioYear = (r, it) => it.ratio_year || yearOf(r);
 
 /**
  * Per currency: kids' expenses paid by each parent and who owes whom.
@@ -459,7 +539,7 @@ function account(list) {
     s[r.payer === "other" ? "other" : "me"] += a.kids;
     for (const it of a.lines) {
       if (!it.kids) continue;
-      if (isSpecial(it)) s.special[yearOf(r)] = (s.special[yearOf(r)] || 0) + it.kids;
+      if (isSpecial(it)) s.special[ratioYear(r, it)] = (s.special[ratioYear(r, it)] || 0) + it.kids;
       else s.base += it.kids;
     }
   }
@@ -549,9 +629,9 @@ async function exportXlsx() {
   for (const r of list) {
     for (const it of allocation(r).lines) {
       if (!it.kids) continue;
-      const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
+      const p = isSpecial(it) ? specialShare(ratioYear(r, it)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
-        Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r)]);
+        Math.round(kidsShare(it) * 100), it.kids, isSpecial(it) ? `${t("cat.special")} ${ratioYear(r, it)}` : t("cat.base"), p, round2(it.kids * p / 100), curOf(r)]);
     }
   }
   const { rows } = account(list);
@@ -692,9 +772,19 @@ function renderReceipt(r) {
         }), "%"),
       kidsShare(it) > 0 && !it.linked && h("div", {}, h("button", {
         class: `tag cat ${isSpecial(it) ? "special" : "base"}`,
-        title: isSpecial(it) ? t("cat.specialHint", { p: specialShare(yearOf(r)).p }) : t("cat.baseHint"),
+        title: isSpecial(it) ? t("cat.specialHint", { y: ratioYear(r, it), p: specialShare(ratioYear(r, it)).p }) : t("cat.baseHint"),
         onclick: () => update(r, () => { r.items[idx].cat = isSpecial(it) ? "base" : "special"; }),
-      }, t(CAT_LABEL[isSpecial(it) ? "special" : "base"])))),
+      }, t(CAT_LABEL[isSpecial(it) ? "special" : "base"]))),
+      kidsShare(it) > 0 && !it.linked && isSpecial(it) && h("div", {},
+        h("input", {
+          class: "pct year", type: "number", min: 2000, max: 2100, step: 1, inputmode: "numeric",
+          value: it.ratio_year || "", placeholder: yearOf(r), "aria-label": t("cat.year"), title: t("cat.year"),
+          onchange: (e) => update(r, () => {
+            const y = e.target.value.trim();
+            if (/^\d{4}$/.test(y) && y !== yearOf(r)) r.items[idx].ratio_year = y;
+            else delete r.items[idx].ratio_year;
+          }),
+        }))),
     h("td", { class: "desc" }, it.description),
     h("td", { class: "num" }, h("button", { class: "amount-btn", onclick: () => editAmount(r, idx) }, fmtNum(it.line_total)))));
 

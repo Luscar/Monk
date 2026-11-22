@@ -210,3 +210,5 @@ main > *, .card > * { min-width: 0; }
 .field .share-row input { width: 96px; min-height: 40px; }
 .field .share-row span { color: var(--text); font-size: .9rem; }
 .field .hint { margin: 0; }
+.pct.year { width: 64px; }
+#prorataChoices { margin-top: 12px; }
