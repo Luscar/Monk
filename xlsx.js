@@ -77,6 +77,7 @@ export async function makeXlsx(sheets) {
 // Reading spreadsheets: cell values, plus the pictures pasted in the workbook (scanned invoices)
 // with the cell they sit on, so each expense row can be linked to its invoice.
 // ---------------------------------------------------------------------------
+const EMU_PER_PT = 12700;
 const REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const all = (node, tag) => (node ? [...node.getElementsByTagNameNS("*", tag)] : []);
 const textOf = (node) => all(node, "t").map((x) => x.textContent).join("");
@@ -152,8 +153,13 @@ export async function readWorkbook(blob) {
     if (!doc) continue;
     const name = sh.getAttribute("name") || "Sheet";
     const rows = [];
+    // Row heights (points), to tell which row a floating picture really sits on.
+    const defaultHt = Number(all(doc, "sheetFormatPr")[0]?.getAttribute("defaultRowHeight")) || 15;
+    const heights = new Map();
     for (const row of all(doc, "row")) {
       const r = Number(row.getAttribute("r")) - 1;
+      const ht = Number(row.getAttribute("ht"));
+      if (ht > 0) heights.set(r, ht);
       const cells = [];
       for (const c of all(row, "c")) {
         const i = colIndex(c.getAttribute("r") || "A");
@@ -191,8 +197,13 @@ export async function readWorkbook(blob) {
           const n = all(all(a, tag)[0], field)[0];
           return n ? Number(n.textContent) : null;
         };
-        const row = at("from", "row");
-        const place = { sheet: name, row, rowEnd: at("to", "row") ?? row, col: at("from", "col"), inCell: false };
+        let row = at("from", "row");
+        let rowEnd = at("to", "row") ?? row;
+        // A picture whose top edge is past the middle of its anchor row is on the next row;
+        // one that ends exactly at the top of a row doesn't cover that row.
+        if (row != null && rowEnd > row && at("from", "rowOff") > (heights.get(row) ?? defaultHt) * EMU_PER_PT / 2) row += 1;
+        if (rowEnd > row && at("to", "rowOff") === 0) rowEnd -= 1;
+        const place = { sheet: name, row, rowEnd, col: at("from", "col"), inCell: false };
         for (const blip of all(a, "blip")) {
           const pic = picture(media.get(blip.getAttributeNS(REL_NS, "embed") || blip.getAttribute("r:embed")) || "");
           if (pic && !pic.places.some((p) => p.sheet === name && p.row === row && p.col === place.col)) pic.places.push(place);

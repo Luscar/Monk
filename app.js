@@ -428,7 +428,18 @@ async function saveInvoices(file, pictures) {
     await db.del("files", old.id);
   }
   const byKey = new Map();
+  const bySha = new Map();
   for (const p of pictures) {
+    const sha256 = await sha256Hex(p.blob);
+    const rows = p.places.filter((x) => x.row != null).map((x) => ({ sheet: x.sheet, row: x.row + 1, rowEnd: (x.rowEnd ?? x.row) + 1, inCell: x.inCell }));
+    // The same image stored twice in the workbook is one invoice (one file, one SHA-256).
+    const same = bySha.get(sha256);
+    if (same) {
+      same.rows.push(...rows);
+      await saveFile(same);
+      byKey.set(p.key, same);
+      continue;
+    }
     const pl = p.places[0];
     const place = pl.row == null ? pl.sheet : `${pl.sheet} ${colLetters(pl.col)}${pl.row + 1}`;
     const rec = {
@@ -439,18 +450,19 @@ async function saveInvoices(file, pictures) {
       type: p.type,
       size: p.blob.size,
       addedAt: file.addedAt,
-      sha256: await sha256Hex(p.blob),
+      sha256,
       blob: p.blob,
       status: "done",
       receiptIds: [],
       payer: file.payer,
       picKey: p.key,
       place,
-      rows: p.places.filter((x) => x.row != null).map((x) => ({ sheet: x.sheet, row: x.row + 1 })),
+      rows,
     };
     files.push(rec);
     await saveFile(rec);
     byKey.set(p.key, rec);
+    bySha.set(sha256, rec);
   }
   return byKey;
 }
@@ -468,21 +480,50 @@ function parseRef(ref) {
 }
 
 /**
- * The invoices of an entry: those Claude named, else any picture placed on the entry's own row.
+ * Where each picture sits, as the entry it belongs to: a picture in a cell or starting on an
+ * entry's row goes to that entry; a floating picture that starts on a non-expense row (a blank
+ * or caption row) goes to the first entry row it covers. Returns source_ref → Set(files).
  */
-function invoicesFor(x, byKey) {
+function picturesByPosition(extracted, byKey) {
+  const entryRows = new Map();
+  for (const x of extracted) {
+    const ref = parseRef(x.source_ref);
+    if (!ref) continue;
+    if (!entryRows.has(ref.sheet)) entryRows.set(ref.sheet, new Set());
+    entryRows.get(ref.sheet).add(ref.row);
+  }
+  const out = new Map();
+  const add = (sheet, row, f) => {
+    const k = `${sheet} L${row}`;
+    if (!out.has(k)) out.set(k, new Set());
+    out.get(k).add(f);
+  };
+  for (const f of new Set(byKey.values())) {
+    for (const p of f.rows) {
+      const here = entryRows.get(p.sheet);
+      if (!here) continue;
+      if (here.has(p.row)) { add(p.sheet, p.row, f); continue; }
+      if (p.inCell) continue;
+      for (let r = p.row + 1; r <= (p.rowEnd ?? p.row); r++) if (here.has(r)) { add(p.sheet, r, f); break; }
+    }
+  }
+  return out;
+}
+
+/** The invoices of an entry: those Claude named, plus any picture placed on the entry's row. */
+function invoicesFor(x, byKey, byPos) {
   const named = (x.picture_ids || []).map((k) => byKey.get(String(k).trim().toUpperCase())).filter(Boolean);
-  if (named.length) return [...new Set(named)];
   const ref = parseRef(x.source_ref);
-  if (!ref) return [];
-  return [...byKey.values()].filter((f) => f.rows.some((p) => p.row === ref.row && (!ref.sheet || p.sheet === ref.sheet)));
+  const placed = ref ? [...(byPos.get(`${ref.sheet} L${ref.row}`) || [])] : [];
+  return [...new Set([...named, ...placed])];
 }
 
 async function createReceipts(file, extracted, byKey = new Map()) {
   const ids = [];
   const touched = new Set();
+  const byPos = picturesByPosition(extracted, byKey);
   for (const { picture_ids, ...x } of extracted) {
-    const invoices = invoicesFor({ ...x, picture_ids }, byKey);
+    const invoices = invoicesFor({ ...x, picture_ids }, byKey, byPos);
     const r = {
       ...x,
       id: nextReceiptId(),
@@ -529,7 +570,9 @@ async function processAll() {
         const { receipts: extracted, pictures } = await extract(client, file);
         const byKey = await saveInvoices(file, pictures);
         file.receiptIds = await createReceipts(file, extracted, byKey);
-        await fillDatesFromInvoices(client, receipts.filter((r) => file.receiptIds.includes(r.id)));
+        const created = receipts.filter((r) => file.receiptIds.includes(r.id));
+        await matchByContent(client, created, [...new Set(byKey.values())]);
+        await fillDatesFromInvoices(client, created);
         file.status = "done";
         if (!extracted.length) toast(t("t.noReceipt", { name: file.name }), 4000);
       } catch (err) {
@@ -549,63 +592,139 @@ async function processAll() {
 }
 
 // ---------------------------------------------------------------------------
-// Dates of Excel lines that have none: read from their linked invoice pictures
+// Invoice pictures: read once (date, store, total…), used to match lines left without an
+// invoice and to date lines that have none
 // ---------------------------------------------------------------------------
-const INVOICE_DATE_SCHEMA = {
+const INVOICE_INFO_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["dates"],
+  required: ["invoices"],
   properties: {
-    dates: {
+    invoices: {
       type: "array",
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["picture", "date"],
+        required: ["picture", "is_invoice", "date", "store_name", "total", "currency", "invoice_number", "items"],
         properties: {
           picture: { type: "string", description: "The label given before the image, e.g. P3" },
+          is_invoice: { type: "boolean" },
           date: { ...nullable("string"), description: "Printed invoice/purchase date YYYY-MM-DD, or null" },
+          store_name: nullable("string"),
+          total: { ...nullable("number"), description: "Total paid" },
+          currency: nullable("string"),
+          invoice_number: nullable("string"),
+          items: { type: "array", items: { type: "string" }, description: "Up to 8 short item names with their amount, e.g. 'Shoes 39.99'" },
         },
       },
     },
   },
 };
 
-const INVOICE_DATE_PROMPT = `Each image is an invoice or receipt, introduced by its label (P1, P2…). For each one, return the purchase or invoice date printed on it as YYYY-MM-DD. Use null when no date is printed or legible, or when the image is not an invoice or receipt. Never use today's date and never guess. For a numeric date such as 03/04/2026, follow the convention of the invoice's country and language (day/month for French-language or Canadian-French invoices, unless the layout clearly shows otherwise).`;
+const INVOICE_INFO_PROMPT = `Each image is an invoice or receipt, introduced by its label (P1, P2…). For each one, return what is printed on it: purchase or invoice date as YYYY-MM-DD, store, total paid, currency, invoice number and up to 8 purchased items with their amount. Use null for anything not printed or not legible, and is_invoice false when the image is not an invoice or receipt. Never use today's date and never guess. For a numeric date such as 03/04/2026, follow the convention of the invoice's country and language (day/month for French-language or Canadian-French invoices, unless the layout clearly shows otherwise).`;
 
-const DATE_BATCH = 8;
+const INFO_BATCH = 8;
 
-/** Reads the printed date of invoice pictures not read yet; stores it on each (string, or null when none). */
-async function readInvoiceDates(client, invoices) {
-  const todo = invoices.filter((f) => f.invoiceDate === undefined && f.blob);
-  for (let i = 0; i < todo.length; i += DATE_BATCH) {
-    const batch = todo.slice(i, i + DATE_BATCH);
+const withFallback = (params) => {
+  if (FALLBACK_MODELS.has(params.model)) {
+    params.betas = ["server-side-fallback-2026-07-01"];
+    params.fallbacks = "default";
+  }
+  return params;
+};
+
+/** Reads invoice pictures not read yet; stores invoiceInfo (object, or null) and invoiceDate on each. */
+async function readInvoiceInfo(client, invoices) {
+  const todo = invoices.filter((f) => f.invoiceInfo === undefined && f.blob);
+  for (let i = 0; i < todo.length; i += INFO_BATCH) {
+    const batch = todo.slice(i, i + INFO_BATCH);
     const content = [];
     for (const f of batch) {
       const img = await prepareImage(f.blob, f.type);
       content.push({ type: "text", text: `Picture ${f.picKey}:` }, { type: "image", source: { type: "base64", media_type: img.media_type, data: img.data } });
     }
-    content.push({ type: "text", text: "Return the printed date of each picture." });
-    const params = {
+    content.push({ type: "text", text: "Return what is printed on each picture." });
+    const message = await client.beta.messages.stream(withFallback({
       model: settings.model,
-      max_tokens: 4000,
-      system: INVOICE_DATE_PROMPT,
-      output_config: { effort: "low", format: { type: "json_schema", schema: INVOICE_DATE_SCHEMA } },
+      max_tokens: 8000,
+      system: INVOICE_INFO_PROMPT,
+      output_config: { effort: "low", format: { type: "json_schema", schema: INVOICE_INFO_SCHEMA } },
       messages: [{ role: "user", content }],
-    };
-    if (FALLBACK_MODELS.has(params.model)) {
-      params.betas = ["server-side-fallback-2026-07-01"];
-      params.fallbacks = "default";
-    }
-    const message = await client.beta.messages.stream(params).finalMessage();
+    })).finalMessage();
     if (message.stop_reason !== "end_turn") continue;
-    let dates = [];
-    try { dates = JSON.parse(message.content.filter((b) => b.type === "text").map((b) => b.text).join("")).dates || []; } catch { continue; }
+    let list = [];
+    try { list = JSON.parse(message.content.filter((b) => b.type === "text").map((b) => b.text).join("")).invoices || []; } catch { continue; }
     for (const f of batch) {
-      const d = dates.find((x) => String(x.picture).trim().toUpperCase() === f.picKey)?.date;
-      f.invoiceDate = /^\d{4}-\d{2}-\d{2}$/.test(d || "") ? d : null;
+      const x = list.find((y) => String(y.picture).trim().toUpperCase() === f.picKey);
+      if (!x) continue;
+      const { picture, ...info } = x;
+      f.invoiceInfo = info.is_invoice ? info : null;
+      f.invoiceDate = info.is_invoice && /^\d{4}-\d{2}-\d{2}$/.test(info.date || "") ? info.date : (f.invoiceDate || null);
       await saveFile(f);
     }
+  }
+}
+
+const MATCH_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["matches"],
+  properties: {
+    matches: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["line", "picture_ids"],
+        properties: {
+          line: { type: "string", description: "The line reference, e.g. Sheet1 L12" },
+          picture_ids: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+  },
+};
+
+const MATCH_PROMPT = `You match lines of an expense list to the invoices that back them. You get the lines that have no invoice yet (date, store, description, amount) and what was read on each invoice picture of the same workbook (date, store, total, items), with the lines already linked to it. Give a line a picture only when they clearly match: same store and an amount equal to the invoice total or to one of its items (or several lines adding up to the total), with a date that agrees when both have one. One invoice may back several lines; it may already back other lines. When unsure, return no picture for that line.`;
+
+/**
+ * Lines still without an invoice after the position/Claude-grid pass: read the workbook's pictures
+ * and match by content (store, amount, date). Only runs when such lines exist.
+ */
+async function matchByContent(client, list, invoices) {
+  const missing = list.filter((r) => !r.invoiceIds?.length);
+  if (!missing.length || !invoices.length) return;
+  try {
+    await readInvoiceInfo(client, invoices);
+    const known = invoices.filter((f) => f.invoiceInfo);
+    if (!known.length) return;
+    const lines = missing.map((r) => ({ line: r.source_ref, date: r.date, store: r.store_name, description: r.items?.[0]?.description, amount: r.items?.[0]?.line_total, currency: r.currency }));
+    const pics = known.map((f) => ({ picture: f.picKey, place: f.place, ...f.invoiceInfo, already_linked_to: f.receiptIds.map((id) => receipts.find((r) => r.id === id)?.source_ref).filter(Boolean) }));
+    const message = await client.beta.messages.stream(withFallback({
+      model: settings.model,
+      max_tokens: 16000,
+      system: MATCH_PROMPT,
+      output_config: { effort: "medium", format: { type: "json_schema", schema: MATCH_SCHEMA } },
+      messages: [{ role: "user", content: [{ type: "text", text: `Lines without an invoice:\n${JSON.stringify(lines)}\n\nInvoice pictures:\n${JSON.stringify(pics)}` }] }],
+    })).finalMessage();
+    if (message.stop_reason !== "end_turn") return;
+    const matches = JSON.parse(message.content.filter((b) => b.type === "text").map((b) => b.text).join("")).matches || [];
+    const byKey = new Map(known.map((f) => [f.picKey, f]));
+    const touched = new Set();
+    for (const m of matches) {
+      const r = missing.find((x) => x.source_ref === String(m.line).trim());
+      if (!r || r.invoiceIds?.length) continue;
+      const found = [...new Set((m.picture_ids || []).map((k) => byKey.get(String(k).trim().toUpperCase())).filter(Boolean))];
+      if (!found.length) continue;
+      r.invoiceIds = found.map((f) => f.id);
+      r.invoiceFrom = "content";
+      await saveReceipt(r);
+      for (const f of found) { f.receiptIds.push(r.id); touched.add(f); }
+    }
+    for (const f of touched) await saveFile(f);
+  } catch (err) {
+    console.error(err);
+    toast(t("t.matchFailed", { msg: describeError(err) }), 5000);
   }
 }
 
@@ -624,7 +743,7 @@ async function fillDatesFromInvoices(client, list) {
   const dateless = list.filter((r) => !r.date && r.invoiceIds?.length);
   if (!dateless.length) return;
   try {
-    await readInvoiceDates(client, [...new Set(dateless.flatMap(invoicesOf))]);
+    await readInvoiceInfo(client, [...new Set(dateless.flatMap(invoicesOf))]);
   } catch (err) {
     console.error(err);
     toast(t("t.dateFailed", { msg: describeError(err) }), 5000);
@@ -835,7 +954,6 @@ function renderInvoiceDialog(r) {
 const payerLabel = (r) => t(r.payer === "other" ? "payer.other" : "payer.me");
 
 /** File-name-safe text that keeps accents (the ZIP stores UTF-8 names). */
-const docName = (s) => String(s).normalize("NFC").replace(/[^\p{L}\p{N}._-]+/gu, "-").replace(/^-+|-+$/g, "").slice(0, 60);
 const extOf = (f) => (f.name.match(/\.[a-z0-9]+$/i) || [""])[0].toLowerCase()
   || { "application/pdf": ".pdf", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp" }[f.type] || ".jpg";
 
@@ -847,8 +965,9 @@ function proofsOf(r) {
 }
 
 /**
- * Builds the report for the chosen period. docs: every proof of a kids' line, named after the first
- * line it backs (R-2026-0003_Dépenses-E3.png), with its SHA-256 computed from the stored file.
+ * Builds the report for the chosen period. docs: every proof of a kids' line, once per content:
+ * its SHA-256 (computed from the stored file) is both its identifier in the report and its file
+ * name in the zip, so lines sharing an invoice show the same value.
  */
 async function buildReport() {
   const list = shownReceipts().filter(inPeriod).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
@@ -856,11 +975,9 @@ async function buildReport() {
   const docsOf = async (r) => {
     const out = [];
     for (const f of proofsOf(r)) {
-      if (!docs.has(f.id)) {
-        const label = f.kind === "invoice" ? f.place : f.name.replace(/\.[a-z0-9]+$/i, "");
-        docs.set(f.id, { name: `${r.id}_${docName(label) || f.kind}${extOf(f)}`, blob: f.blob, sha256: await sha256Hex(f.blob) });
-      }
-      out.push(docs.get(f.id));
+      const sha256 = await sha256Hex(f.blob);
+      if (!docs.has(sha256)) docs.set(sha256, { name: `${sha256}${extOf(f)}`, blob: f.blob, sha256 });
+      if (!out.includes(docs.get(sha256))) out.push(docs.get(sha256));
     }
     return out;
   };
@@ -873,7 +990,7 @@ async function buildReport() {
       const p = isSpecial(it) ? specialShare(yearOf(r)).p : BASE_SHARE;
       lines.push([r.id, r.date, r.store_name, payerLabel(r), `${it.linked ? "↳ " : ""}${it.description}`, it.line_total,
         Math.round(kidsShare(it) * 100), it.kids, t(isSpecial(it) ? "cat.special" : "cat.base"), p, round2(it.kids * p / 100), curOf(r),
-        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.name).join(", "), proofs.map((d) => d.sha256).join(", ")]);
+        [r.source, r.source_ref].filter(Boolean).join(" · "), proofs.map((d) => d.sha256).join(", ")]);
     }
   }
   const { rows } = account(list);
@@ -897,7 +1014,7 @@ async function buildReport() {
   }
   const xlsx = await makeXlsx([
     { name: t("xl.account"), rows: summary, money: [1], widths: { 0: 44, 1: 20 } },
-    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 13: 36, 14: 66 } },
+    { name: t("xl.lines"), rows: lines, money: [5, 7, 10], widths: { 4: 40, 8: 14, 12: 36, 13: 66 } },
   ]);
   return { xlsx, docs: [...docs.values()] };
 }
