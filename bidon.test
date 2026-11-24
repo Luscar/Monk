@@ -1,0 +1,351 @@
+using AT99.Framework.Infra.Processus;
+using AT99.Framework.Infra.Processus.Modeles;
+using AT99.Framework.Infra.Processus.Modeles.Bpm;
+using Moq;
+using Xunit;
+
+namespace AT99.Framework.Infra.Processus.Tests;
+
+public class ServiceProcessusTests
+{
+    // ─────────────────────────────────────────────────────────────────────────
+    // À ADAPTER : remplace par de vraies valeurs de TypeProcessus du projet.
+    //   TypeTete      : EstProcessusDeTete = true
+    //   TypeSous      : sous-processus (EstProcessusDeTete = false)
+    //   TypeAutreTete : un 2e processus de tête (pour les cas multi-corrélations)
+    // ─────────────────────────────────────────────────────────────────────────
+    private static readonly TypeProcessus TypeTete = TypeProcessus.DECLARATION;
+    private static readonly TypeProcessus TypeSous = TypeProcessus.SOUS_PROCESSUS;
+    private static readonly TypeProcessus TypeAutreTete = TypeProcessus.PERIODE;
+
+    // À ADAPTER si ProcessusBpm / TacheBpm se construisent autrement.
+    private static ProcessusBpm Instance(long id, TypeProcessus type, long? parent = null) => new()
+    {
+        IdInstanceProcessus = id,
+        IdInstanceProcessusParent = parent,
+        IdProcessus = type.Nom, // valeur lue par Enumeration.DepuisNom<TypeProcessus>
+    };
+
+    private static TacheBpm Tache(long id, string code) => new() { Id = id, Code = code };
+
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private const string Signal = "SIGNAL_OK";
+    private const string CodeTache = "TACHE_SUIVANTE";
+    private sealed record Contenu(string Valeur);
+
+    private readonly Mock<IAgentServiceBpm> agent = new();
+    private readonly Mock<IAgentServiceTacheBpm> agentTache = new();
+    private readonly Correlation correlation = new("CORR-1", TypeTete);
+    private readonly ServiceProcessusTestable service;
+
+    public ServiceProcessusTests()
+    {
+        var modes = new[] { TypeTete, TypeSous, TypeAutreTete }.Select(t => t.ModeTraitement).Distinct().ToList();
+        service = new ServiceProcessusTestable(
+            modes.ToDictionary(m => m, _ => agent.Object),
+            modes.ToDictionary(m => m, _ => agentTache.Object));
+    }
+
+    /// <summary>Supprime l'attente entre les tentatives et simule la recherche de tâche.</summary>
+    private sealed class ServiceProcessusTestable(
+        IReadOnlyDictionary<ModeTraitement, IAgentServiceBpm> agents,
+        IReadOnlyDictionary<ModeTraitement, IAgentServiceTacheBpm> agentsTache)
+        : ServiceProcessus(agents, agentsTache)
+    {
+        public Func<long, TacheBpm?> TacheDe { get; set; } = _ => null;
+        public List<long> InstancesInterrogees { get; } = [];
+
+        protected override IReadOnlyList<TimeSpan> DelaisAttenteTache { get; } =
+            [TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero];
+
+        protected override Task<TacheBpm?> ObtenirTacheAPartirProcessusAsync(ModeTraitement mode, long numeroProcessus)
+        {
+            InstancesInterrogees.Add(numeroProcessus);
+            return Task.FromResult(TacheDe(numeroProcessus));
+        }
+    }
+
+    private void Instances(string idCorrelation, params ProcessusBpm[] instances) =>
+        agent.Setup(a => a.ObtenirInstancesProcessusAsync(idCorrelation)).ReturnsAsync(instances);
+
+    private void Signaux(long idInstance, params string[] signaux) =>
+        agent.Setup(a => a.ObtenirSignauxEnAttenteAsync(idInstance)).ReturnsAsync(signaux);
+
+    private void VerifierAucuneEmission() =>
+        agent.Verify(a => a.EmettreSignalAsync(It.IsAny<long>(), It.IsAny<string>(), It.IsAny<It.IsAnyType>()), Times.Never);
+
+    private static async Task<RaisonEchecProcessus> RaisonAsync(Func<Task> action) =>
+        (await Assert.ThrowsAsync<ProcessusBpmException>(action)).Raison;
+
+    // ── EstProcessusEnCoursAsync ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task EstProcessusEnCours_vrai_si_une_instance_existe()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Assert.True(await service.EstProcessusEnCoursAsync(correlation));
+    }
+
+    [Fact]
+    public async Task EstProcessusEnCours_faux_si_aucune_instance()
+    {
+        Instances("CORR-1");
+        Assert.False(await service.EstProcessusEnCoursAsync(correlation));
+    }
+
+    // ── DemarrerProcessusAsync / TerminerTacheAsync ──────────────────────────
+
+    [Fact]
+    public async Task DemarrerProcessus_cree_le_processus_avec_la_correlation()
+    {
+        agent.Setup(a => a.CreerSansDateProductionAsync(
+                TypeTete.Code, It.IsAny<Dictionary<string, object>>(), "CORR-1"))
+            .ReturnsAsync(42);
+
+        Assert.Equal(42, await service.DemarrerProcessusAsync(correlation, new ProcessusAT()));
+    }
+
+    [Fact]
+    public async Task TerminerTache_delegue_a_l_agent_de_tache()
+    {
+        var contenu = new Contenu("x");
+
+        await service.TerminerTacheAsync(99, contenu, TypeTete.ModeTraitement);
+
+        agentTache.Verify(a => a.TerminerAsync(99, contenu), Times.Once);
+    }
+
+    // ── AvancerATacheSuivanteAsync : recherche du signal ─────────────────────
+
+    [Fact]
+    public async Task Avancer_echoue_si_aucun_processus()
+    {
+        Instances("CORR-1");
+
+        var raison = await RaisonAsync(() =>
+            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.AucunProcessus, raison);
+        VerifierAucuneEmission();
+    }
+
+    [Fact]
+    public async Task Avancer_ignore_les_correlations_qui_ne_sont_pas_de_tete()
+    {
+        var correlationSous = new Correlation("CORR-SOUS", TypeSous);
+
+        var raison = await RaisonAsync(() =>
+            service.AvancerATacheSuivanteAsync([correlationSous], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.AucunProcessus, raison);
+        agent.Verify(a => a.ObtenirInstancesProcessusAsync(It.IsAny<string>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task Avancer_echoue_si_aucun_signal_attendu()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, "AUTRE_SIGNAL");
+
+        var raison = await RaisonAsync(() =>
+            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.AucunSignalEnAttente, raison);
+        VerifierAucuneEmission();
+    }
+
+    [Fact]
+    public async Task Avancer_traite_des_signaux_null_comme_une_liste_vide()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        agent.Setup(a => a.ObtenirSignauxEnAttenteAsync(10)).ReturnsAsync((IEnumerable<string>)null!);
+
+        var raison = await RaisonAsync(() =>
+            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.AucunSignalEnAttente, raison);
+    }
+
+    [Fact]
+    public async Task Avancer_n_emet_rien_si_plusieurs_instances_attendent_le_signal()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Instances("CORR-2", Instance(20, TypeAutreTete));
+        Signaux(10, Signal);
+        Signaux(20, Signal);
+
+        var raison = await RaisonAsync(() => service.AvancerATacheSuivanteAsync(
+            [correlation, new Correlation("CORR-2", TypeAutreTete)], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.SignalAmbigu, raison);
+        VerifierAucuneEmission();
+    }
+
+    [Fact]
+    public async Task Avancer_n_interroge_que_l_instance_la_plus_basse_de_chaque_chaine()
+    {
+        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
+        Signaux(11, Signal);
+        service.TacheDe = id => id == 10 ? Tache(500, CodeTache) : null;
+
+        await service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache);
+
+        agent.Verify(a => a.ObtenirSignauxEnAttenteAsync(10), Times.Never);
+        agent.Verify(a => a.ObtenirSignauxEnAttenteAsync(11), Times.Once);
+    }
+
+    // ── AvancerATacheSuivanteAsync : émission et tâche suivante ──────────────
+
+    [Fact]
+    public async Task Avancer_emet_le_signal_et_retourne_la_tache_suivante()
+    {
+        var contenu = new Contenu("x");
+        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
+        Signaux(11, "AUTRE_SIGNAL", Signal);
+        service.TacheDe = id => id == 10 ? Tache(500, CodeTache) : null;
+
+        var idTache = await service.AvancerATacheSuivanteAsync([correlation], ["X", Signal], contenu, CodeTache);
+
+        Assert.Equal(500, idTache);
+        agent.Verify(a => a.EmettreSignalAsync(11, Signal, contenu), Times.Once);
+    }
+
+    [Fact]
+    public async Task Avancer_attend_que_le_moteur_cree_la_tache_suivante()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, Signal);
+        var appels = 0;
+        // 1re lecture : ancienne tâche encore présente ; 2e : tâche suivante créée.
+        service.TacheDe = _ => ++appels == 1 ? Tache(400, "ANCIENNE_TACHE") : Tache(500, CodeTache);
+
+        var idTache = await service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache);
+
+        Assert.Equal(500, idTache);
+        Assert.Equal(2, appels);
+    }
+
+    [Fact]
+    public async Task Avancer_trouve_la_tache_dans_un_sous_processus_demarre_par_le_signal()
+    {
+        agent.SetupSequence(a => a.ObtenirInstancesProcessusAsync("CORR-1"))
+            .ReturnsAsync([Instance(10, TypeTete)])                                   // recherche du signal
+            .ReturnsAsync([Instance(10, TypeTete), Instance(12, TypeSous, parent: 10)]); // après le signal
+        Signaux(10, Signal);
+        service.TacheDe = id => id == 12 ? Tache(600, CodeTache) : null;
+
+        var idTache = await service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache);
+
+        Assert.Equal(600, idTache);
+    }
+
+    [Fact]
+    public async Task Avancer_ne_cherche_la_tache_que_dans_la_correlation_signalee()
+    {
+        var correlation2 = new Correlation("CORR-2", TypeAutreTete);
+        Instances("CORR-1", Instance(10, TypeTete));
+        Instances("CORR-2", Instance(20, TypeAutreTete));
+        Signaux(10, Signal);
+        service.TacheDe = id => id == 10 ? Tache(500, CodeTache) : Tache(900, CodeTache);
+
+        var idTache = await service.AvancerATacheSuivanteAsync(
+            [correlation, correlation2], [Signal], new Contenu("x"), CodeTache);
+
+        Assert.Equal(500, idTache);
+        Assert.DoesNotContain(20L, service.InstancesInterrogees);
+        agent.Verify(a => a.ObtenirInstancesProcessusAsync("CORR-2"), Times.Once); // recherche du signal seulement
+    }
+
+    [Fact]
+    public async Task Avancer_echoue_si_la_tache_suivante_n_apparait_pas()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, Signal);
+        service.TacheDe = _ => Tache(400, "ANCIENNE_TACHE");
+
+        var raison = await RaisonAsync(() =>
+            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.TacheSuivanteIntrouvable, raison);
+        // Le signal est déjà émis : le front doit relire la tâche, pas relancer l'action.
+        agent.Verify(a => a.EmettreSignalAsync(10, Signal, It.IsAny<Contenu>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task Avancer_echoue_si_plusieurs_taches_portent_le_code()
+    {
+        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
+        Signaux(11, Signal);
+        service.TacheDe = id => Tache(id * 100, CodeTache);
+
+        var raison = await RaisonAsync(() =>
+            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
+
+        Assert.Equal(RaisonEchecProcessus.TacheSuivanteAmbigue, raison);
+    }
+
+    // ── TerminerTacheSiEnAttenteAsync (obsolète) ─────────────────────────────
+
+#pragma warning disable CS0618
+    [Fact]
+    public async Task SiEnAttente_retourne_le_parent_de_l_instance_signalee()
+    {
+        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
+        Signaux(11, Signal);
+
+        Assert.Equal(10, await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+    }
+
+    [Fact]
+    public async Task SiEnAttente_retourne_l_instance_elle_meme_si_elle_est_racine()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, Signal);
+
+        Assert.Equal(10, await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+    }
+
+    [Fact]
+    public async Task SiEnAttente_retourne_null_si_aucun_processus()
+    {
+        Instances("CORR-1");
+
+        Assert.Null(await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+    }
+
+    [Fact]
+    public async Task SiEnAttente_retourne_null_sans_emettre_si_aucun_signal_attendu()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, "AUTRE_SIGNAL");
+
+        Assert.Null(await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+        VerifierAucuneEmission();
+    }
+#pragma warning restore CS0618
+
+    // ── TerminerTacheEnAttenteAsync ──────────────────────────────────────────
+
+    [Fact]
+    public async Task EnAttente_emet_le_signal_sans_contenu()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, Signal);
+
+        await service.TerminerTacheEnAttenteAsync([correlation], Signal);
+
+        agent.Verify(a => a.EmettreSignalAsync<object?>(10, Signal, null), Times.Once);
+    }
+
+    [Fact]
+    public async Task EnAttente_echoue_si_le_signal_n_est_pas_attendu()
+    {
+        Instances("CORR-1", Instance(10, TypeTete));
+        Signaux(10, "AUTRE_SIGNAL");
+
+        var raison = await RaisonAsync(() => service.TerminerTacheEnAttenteAsync([correlation], Signal));
+
+        Assert.Equal(RaisonEchecProcessus.AucunSignalEnAttente, raison);
+    }
+}
