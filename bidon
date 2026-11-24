@@ -41,7 +41,9 @@ public class ServiceProcessus(
         TimeSpan.FromMilliseconds(2000),
     ];
 
-    private sealed record Candidat(ProcessusBpm Instance, string Signal, TypeProcessus Type);
+    private sealed record InstanceCorrelee(ProcessusBpm Instance, Correlation Correlation);
+
+    private sealed record Candidat(ProcessusBpm Instance, string Signal, TypeProcessus Type, Correlation Correlation);
 
     private enum StatutEmission { Emis, AucunProcessus, AucunSignalEnAttente }
 
@@ -78,12 +80,13 @@ public class ServiceProcessus(
     public async Task<long> AvancerATacheSuivanteAsync<T>(
         IEnumerable<Correlation> correlations, string[] nomsSignaux, T contenu, string codeProchaineTache)
     {
-        var listeCorrelations = correlations.ToList(); // énuméré plusieurs fois
-
-        var resultat = await EmettreSignalUniqueAsync(listeCorrelations, nomsSignaux, contenu);
+        var resultat = await EmettreSignalUniqueAsync(correlations, nomsSignaux, contenu);
         Exiger(resultat, nomsSignaux);
 
-        return await AttendreTacheAsync(listeCorrelations, codeProchaineTache);
+        // On cherche la tâche seulement dans la corrélation de l'instance signalée :
+        // processus de tête et tous ses sous-processus, y compris ceux que le
+        // signal vient de démarrer.
+        return await AttendreTacheAsync(resultat.Emis!.Correlation, codeProchaineTache);
     }
 
     /// <summary>
@@ -95,7 +98,7 @@ public class ServiceProcessus(
     public async Task<long?> TerminerTacheSiEnAttenteAsync<T>(
         IEnumerable<Correlation> correlations, string[] nomsSignaux, T contenu)
     {
-        var resultat = await EmettreSignalUniqueAsync(correlations.ToList(), nomsSignaux, contenu);
+        var resultat = await EmettreSignalUniqueAsync(correlations, nomsSignaux, contenu);
 
         return resultat.Emis is { Instance: var instance }
             ? instance.IdInstanceProcessusParent ?? instance.IdInstanceProcessus
@@ -107,18 +110,19 @@ public class ServiceProcessus(
     public async Task TerminerTacheEnAttenteAsync(IEnumerable<Correlation> correlations, string nomSignal)
     {
         string[] noms = [nomSignal];
-        var resultat = await EmettreSignalUniqueAsync<object?>(correlations.ToList(), noms, null);
+        var resultat = await EmettreSignalUniqueAsync<object?>(correlations, noms, null);
         Exiger(resultat, noms);
     }
 
     // ── Cœur commun ─────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Trouve l'unique instance qui attend un des signaux et l'émet.
-    /// N'émet rien et lève une exception si plusieurs instances correspondent.
+    /// Cherche, parmi toutes les corrélations, l'unique instance qui attend un
+    /// des signaux et l'émet. N'émet rien et lève une exception si plusieurs
+    /// instances correspondent.
     /// </summary>
     private async Task<ResultatEmission> EmettreSignalUniqueAsync<T>(
-        IReadOnlyList<Correlation> correlations, string[] nomsSignaux, T contenu)
+        IEnumerable<Correlation> correlations, string[] nomsSignaux, T contenu)
     {
         var instances = await ObtenirInstancesAsync(correlations);
         if (instances.Count == 0)
@@ -146,30 +150,43 @@ public class ServiceProcessus(
         return new(StatutEmission.Emis, candidat);
     }
 
-    private async Task<List<ProcessusBpm>> ObtenirInstancesAsync(IEnumerable<Correlation> correlations)
+    /// <summary>Instances des processus de tête, chacune avec sa corrélation d'origine.</summary>
+    private async Task<List<InstanceCorrelee>> ObtenirInstancesAsync(IEnumerable<Correlation> correlations)
     {
         var resultats = await Task.WhenAll(correlations
             .Where(c => c.TypeProcessus.EstProcessusDeTete)
-            .Select(c => Agent(c.TypeProcessus).ObtenirInstancesProcessusAsync(c.IdCorrelation)));
+            .Select(async c =>
+            {
+                var instances = await Agent(c.TypeProcessus).ObtenirInstancesProcessusAsync(c.IdCorrelation);
+                return instances.Select(i => new InstanceCorrelee(i, c));
+            }));
 
         // Si l'agent retourne aussi les instances terminées, les filtrer ici.
         return resultats.SelectMany(x => x).ToList();
     }
 
     private async Task<List<Candidat>> TrouverCandidatsAsync(
-        List<ProcessusBpm> instances, IReadOnlySet<string> signauxAcceptes)
+        List<InstanceCorrelee> instances, IReadOnlySet<string> signauxAcceptes)
     {
+        var correlationDe = new Dictionary<long, Correlation>();
+        foreach (var i in instances)
+            correlationDe.TryAdd(i.Instance.IdInstanceProcessus, i.Correlation);
+
         // Seule l'instance la plus basse de chaque chaîne peut attendre le signal.
-        var parInstance = await Task.WhenAll(instances.EnChaines()
+        var parInstance = await Task.WhenAll(instances
+            .Select(i => i.Instance)
+            .ToList()
+            .EnChaines()
             .Select(chaine => chaine.PlusBas)
             .Select(async instance =>
             {
                 var type = TypeDe(instance);
+                var correlation = correlationDe[instance.IdInstanceProcessus];
                 var signaux = await Agent(type).ObtenirSignauxEnAttenteAsync(instance.IdInstanceProcessus) ?? [];
 
                 return signaux
                     .Where(signauxAcceptes.Contains)
-                    .Select(signal => new Candidat(instance, signal, type));
+                    .Select(signal => new Candidat(instance, signal, type, correlation));
             }));
 
         return parInstance.SelectMany(x => x).ToList();
@@ -177,18 +194,20 @@ public class ServiceProcessus(
 
     /// <summary>
     /// Attend que la tâche portant le code demandé apparaisse dans une des
-    /// instances corrélées. On relit les instances à chaque tentative, car le
-    /// signal peut avoir démarré un nouveau sous-processus. Chercher par code
-    /// évite aussi de retourner l'ancienne tâche si le moteur n'a pas encore avancé.
+    /// instances de la corrélation. On relit les instances à chaque tentative,
+    /// car le signal peut avoir démarré un nouveau sous-processus. Chercher par
+    /// code évite de retourner l'ancienne tâche si le moteur n'a pas encore avancé.
     /// </summary>
-    private async Task<long> AttendreTacheAsync(IReadOnlyList<Correlation> correlations, string codeTache)
+    private async Task<long> AttendreTacheAsync(Correlation correlation, string codeTache)
     {
+        var agent = Agent(correlation.TypeProcessus);
+
         foreach (var delai in DelaisAttenteTache)
         {
             if (delai > TimeSpan.Zero)
                 await Task.Delay(delai);
 
-            var instances = await ObtenirInstancesAsync(correlations);
+            var instances = await agent.ObtenirInstancesProcessusAsync(correlation.IdCorrelation);
             var taches = await Task.WhenAll(instances.Select(i =>
                 ObtenirTacheAPartirProcessusAsync(TypeDe(i).ModeTraitement, i.IdInstanceProcessus)));
 
@@ -203,13 +222,13 @@ public class ServiceProcessus(
                     return correspondantes[0].Id; // À ADAPTER : propriété du numéro de tâche
                 case > 1:
                     throw new ProcessusBpmException(RaisonEchecProcessus.TacheSuivanteAmbigue,
-                        $"Plusieurs tâches « {codeTache} » actives : " +
+                        $"Plusieurs tâches « {codeTache} » actives pour la corrélation {correlation.IdCorrelation} : " +
                         string.Join(", ", correspondantes.Select(t => t.Id)));
             }
         }
 
         throw new ProcessusBpmException(RaisonEchecProcessus.TacheSuivanteIntrouvable,
-            $"La tâche « {codeTache} » n'est pas apparue après l'émission du signal.");
+            $"La tâche « {codeTache} » n'est pas apparue pour la corrélation {correlation.IdCorrelation}.");
     }
 
     private static void Exiger(ResultatEmission resultat, string[] nomsSignaux)
