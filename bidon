@@ -1,0 +1,263 @@
+using AT99.Framework.Commun.Types.Enumerations;
+using AT99.Framework.Infra.Processus.Modeles;
+using AT99.Framework.Infra.Processus.Modeles.Bpm;
+
+namespace AT99.Framework.Infra.Processus;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ERREURS MÉTIER
+// Une seule exception typée : le contrôleur traduit la Raison en code HTTP.
+// ─────────────────────────────────────────────────────────────────────────────
+public enum RaisonEchecProcessus
+{
+    AucunProcessus,
+    AucunSignalEnAttente,
+    SignalAmbigu,
+    TacheSuivanteIntrouvable,
+    TacheSuivanteAmbigue
+}
+
+public sealed class ProcessusBpmException(RaisonEchecProcessus raison, string message)
+    : InvalidOperationException(message)
+{
+    public RaisonEchecProcessus Raison { get; } = raison;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SERVICE
+// ─────────────────────────────────────────────────────────────────────────────
+public class ServiceProcessus(
+    IReadOnlyDictionary<ModeTraitement, IAgentServiceBpm> agentsServices,
+    IReadOnlyDictionary<ModeTraitement, IAgentServiceTacheBpm> agentsServicesTache)
+    : IServiceProcessus
+{
+    // Le moteur peut créer la tâche suivante un peu après l'émission du signal.
+    private static readonly TimeSpan[] DelaisAttenteTache =
+    [
+        TimeSpan.Zero,
+        TimeSpan.FromMilliseconds(200),
+        TimeSpan.FromMilliseconds(500),
+        TimeSpan.FromMilliseconds(1000),
+        TimeSpan.FromMilliseconds(2000),
+    ];
+
+    private sealed record Candidat(ProcessusBpm Instance, string Signal, TypeProcessus Type);
+
+    private enum StatutEmission { Emis, AucunProcessus, AucunSignalEnAttente }
+
+    private sealed record ResultatEmission(StatutEmission Statut, Candidat? Emis = null);
+
+    // ── Démarrage / état ────────────────────────────────────────────────────
+
+    public async Task<bool> EstProcessusEnCoursAsync(Correlation correlation)
+    {
+        var instances = await Agent(correlation.TypeProcessus)
+            .ObtenirInstancesProcessusAsync(correlation.IdCorrelation);
+        return instances.Any();
+    }
+
+    public Task<long> DemarrerProcessusAsync(Correlation correlation, ProcessusAT processus) =>
+        Agent(correlation.TypeProcessus).CreerSansDateProductionAsync(
+            correlation.TypeProcessus.Code,   // À ADAPTER : id de définition du processus
+            processus.ObtenirVariables(),     // À ADAPTER : variables tirées de ProcessusAT
+            correlation.IdCorrelation);
+
+    // ── Terminer une tâche connue ───────────────────────────────────────────
+
+    public Task TerminerTacheAsync<T>(long numeroTache, T contenu, ModeTraitement modeTraitement) =>
+        agentsServicesTache[modeTraitement].TerminerAsync(numeroTache, contenu);
+
+    // ── Émettre un signal attendu ───────────────────────────────────────────
+
+    /// <summary>
+    /// Émet le signal attendu puis retourne le numéro de la prochaine tâche
+    /// utilisateur dont le code est <paramref name="codeProchaineTache"/>.
+    /// À utiliser pour rediriger le front.
+    /// </summary>
+    /// <exception cref="ProcessusBpmException">Voir <see cref="RaisonEchecProcessus"/>.</exception>
+    public async Task<long> AvancerATacheSuivanteAsync<T>(
+        IEnumerable<Correlation> correlations, string[] nomsSignaux, T contenu, string codeProchaineTache)
+    {
+        var listeCorrelations = correlations.ToList(); // énuméré plusieurs fois
+
+        var resultat = await EmettreSignalUniqueAsync(listeCorrelations, nomsSignaux, contenu);
+        Exiger(resultat, nomsSignaux);
+
+        return await AttendreTacheAsync(listeCorrelations, codeProchaineTache);
+    }
+
+    /// <summary>
+    /// Émet le signal s'il est attendu. Retourne le processus où se poursuit le
+    /// travail (le parent de l'instance signalée, ou l'instance elle-même si
+    /// elle est racine), ou null si rien n'était en attente.
+    /// </summary>
+    [Obsolete("Utiliser AvancerATacheSuivanteAsync, qui retourne directement la prochaine tâche.")]
+    public async Task<long?> TerminerTacheSiEnAttenteAsync<T>(
+        IEnumerable<Correlation> correlations, string[] nomsSignaux, T contenu)
+    {
+        var resultat = await EmettreSignalUniqueAsync(correlations.ToList(), nomsSignaux, contenu);
+
+        return resultat.Emis is { Instance: var instance }
+            ? instance.IdInstanceProcessusParent ?? instance.IdInstanceProcessus
+            : null;
+    }
+
+    /// <summary>Émet un signal sans contenu. Le signal doit être en attente.</summary>
+    /// <remarks>0 référence actuellement : candidat à la suppression.</remarks>
+    public async Task TerminerTacheEnAttenteAsync(IEnumerable<Correlation> correlations, string nomSignal)
+    {
+        string[] noms = [nomSignal];
+        var resultat = await EmettreSignalUniqueAsync<object?>(correlations.ToList(), noms, null);
+        Exiger(resultat, noms);
+    }
+
+    // ── Cœur commun ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Trouve l'unique instance qui attend un des signaux et l'émet.
+    /// N'émet rien et lève une exception si plusieurs instances correspondent.
+    /// </summary>
+    private async Task<ResultatEmission> EmettreSignalUniqueAsync<T>(
+        IReadOnlyList<Correlation> correlations, string[] nomsSignaux, T contenu)
+    {
+        var instances = await ObtenirInstancesAsync(correlations);
+        if (instances.Count == 0)
+            return new(StatutEmission.AucunProcessus);
+
+        var signauxAcceptes = nomsSignaux.ToHashSet(StringComparer.Ordinal);
+        var candidats = await TrouverCandidatsAsync(instances, signauxAcceptes);
+
+        switch (candidats.Count)
+        {
+            case 0:
+                return new(StatutEmission.AucunSignalEnAttente);
+
+            case > 1:
+                var detail = string.Join(", ", candidats.Select(c =>
+                    $"{c.Signal} sur {c.Instance.IdProcessus} (ID {c.Instance.IdInstanceProcessus})"));
+                throw new ProcessusBpmException(RaisonEchecProcessus.SignalAmbigu,
+                    $"Plusieurs instances attendent un des signaux : {detail}");
+        }
+
+        var candidat = candidats[0];
+        await Agent(candidat.Type).EmettreSignalAsync(
+            candidat.Instance.IdInstanceProcessus, candidat.Signal, contenu);
+
+        return new(StatutEmission.Emis, candidat);
+    }
+
+    private async Task<List<ProcessusBpm>> ObtenirInstancesAsync(IEnumerable<Correlation> correlations)
+    {
+        var resultats = await Task.WhenAll(correlations
+            .Where(c => c.TypeProcessus.EstProcessusDeTete)
+            .Select(c => Agent(c.TypeProcessus).ObtenirInstancesProcessusAsync(c.IdCorrelation)));
+
+        // Si l'agent retourne aussi les instances terminées, les filtrer ici.
+        return resultats.SelectMany(x => x).ToList();
+    }
+
+    private async Task<List<Candidat>> TrouverCandidatsAsync(
+        List<ProcessusBpm> instances, IReadOnlySet<string> signauxAcceptes)
+    {
+        // Seule l'instance la plus basse de chaque chaîne peut attendre le signal.
+        var parInstance = await Task.WhenAll(instances.EnChaines()
+            .Select(chaine => chaine.PlusBas)
+            .Select(async instance =>
+            {
+                var type = TypeDe(instance);
+                var signaux = await Agent(type).ObtenirSignauxEnAttenteAsync(instance.IdInstanceProcessus) ?? [];
+
+                return signaux
+                    .Where(signauxAcceptes.Contains)
+                    .Select(signal => new Candidat(instance, signal, type));
+            }));
+
+        return parInstance.SelectMany(x => x).ToList();
+    }
+
+    /// <summary>
+    /// Attend que la tâche portant le code demandé apparaisse dans une des
+    /// instances corrélées. On relit les instances à chaque tentative, car le
+    /// signal peut avoir démarré un nouveau sous-processus. Chercher par code
+    /// évite aussi de retourner l'ancienne tâche si le moteur n'a pas encore avancé.
+    /// </summary>
+    private async Task<long> AttendreTacheAsync(IReadOnlyList<Correlation> correlations, string codeTache)
+    {
+        foreach (var delai in DelaisAttenteTache)
+        {
+            if (delai > TimeSpan.Zero)
+                await Task.Delay(delai);
+
+            var instances = await ObtenirInstancesAsync(correlations);
+            var taches = await Task.WhenAll(instances.Select(i =>
+                ObtenirTacheAPartirProcessusAsync(TypeDe(i).ModeTraitement, i.IdInstanceProcessus)));
+
+            var correspondantes = taches
+                .OfType<TacheBpm>()
+                .Where(t => string.Equals(t.Code, codeTache, StringComparison.Ordinal)) // À ADAPTER : propriété du code
+                .ToList();
+
+            switch (correspondantes.Count)
+            {
+                case 1:
+                    return correspondantes[0].Id; // À ADAPTER : propriété du numéro de tâche
+                case > 1:
+                    throw new ProcessusBpmException(RaisonEchecProcessus.TacheSuivanteAmbigue,
+                        $"Plusieurs tâches « {codeTache} » actives : " +
+                        string.Join(", ", correspondantes.Select(t => t.Id)));
+            }
+        }
+
+        throw new ProcessusBpmException(RaisonEchecProcessus.TacheSuivanteIntrouvable,
+            $"La tâche « {codeTache} » n'est pas apparue après l'émission du signal.");
+    }
+
+    private static void Exiger(ResultatEmission resultat, string[] nomsSignaux)
+    {
+        switch (resultat.Statut)
+        {
+            case StatutEmission.AucunProcessus:
+                throw new ProcessusBpmException(RaisonEchecProcessus.AucunProcessus,
+                    "Aucun processus actif pour ces corrélations.");
+            case StatutEmission.AucunSignalEnAttente:
+                throw new ProcessusBpmException(RaisonEchecProcessus.AucunSignalEnAttente,
+                    $"Aucune instance n'attend un des signaux [{string.Join(", ", nomsSignaux)}].");
+        }
+    }
+
+    // ── Utilitaires ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Tâche utilisateur active d'une instance, ou null.
+    /// GARDE TON IMPLÉMENTATION EXISTANTE : aucun des deux agents n'expose
+    /// de recherche de tâche par instance de processus.
+    /// </summary>
+    private async Task<TacheBpm?> ObtenirTacheAPartirProcessusAsync(ModeTraitement modeTraitement, long numeroProcessus)
+    {
+        throw new NotImplementedException("Coller ici l'implémentation existante.");
+    }
+
+    private static TypeProcessus TypeDe(ProcessusBpm instance) =>
+        Enumeration.DepuisNom<TypeProcessus>(instance.IdProcessus);
+
+    private IAgentServiceBpm Agent(TypeProcessus type) =>
+        agentsServices[type.ModeTraitement];
+}
+
+/*
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Exemple de traduction des erreurs dans le contrôleur
+ * (ou mieux, dans un IExceptionHandler global) :
+ *
+ * catch (ProcessusBpmException ex)
+ * {
+ *     return ex.Raison switch
+ *     {
+ *         RaisonEchecProcessus.AucunProcessus           => NotFound(ex.Message),
+ *         RaisonEchecProcessus.AucunSignalEnAttente     => Conflict(ex.Message),   // tâche déjà traitée
+ *         RaisonEchecProcessus.TacheSuivanteIntrouvable => Accepted(),            // le front peut réessayer
+ *         _                                             => Problem(ex.Message),   // ambiguïtés = bug de config
+ *     };
+ * }
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
