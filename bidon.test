@@ -112,7 +112,7 @@ public class ServiceProcessusTests
     // ── EstProcessusEnCoursAsync ─────────────────────────────────────────────
 
     [Fact]
-    public async Task EstProcessusEnCours_vrai_si_une_instance_existe()
+    public async Task EstProcessusEnCoursRetourneVraiSiUneInstanceExisteAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
 
@@ -120,7 +120,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task EstProcessusEnCours_faux_si_aucune_instance()
+    public async Task EstProcessusEnCoursRetourneFauxSiAucuneInstanceAsync()
     {
         Instances(correlation);
 
@@ -130,7 +130,7 @@ public class ServiceProcessusTests
     // ── DemarrerProcessusAsync / TerminerTacheAsync ──────────────────────────
 
     [Fact]
-    public async Task DemarrerProcessus_cree_le_processus_avec_la_correlation()
+    public async Task DemarrerProcessusCreeLeProcessusAvecLaCorrelationAsync()
     {
         var idCree = fixture.Create<long>();
         agent.CreerSansDateProductionAsync(TypeTete.Code, Arg.Any<Dictionary<string, object>>(), correlation.IdCorrelation)
@@ -140,7 +140,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task TerminerTache_delegue_a_l_agent_de_tache()
+    public async Task TerminerTacheDelegueAAgentDeTacheAsync()
     {
         var numeroTache = fixture.Create<long>();
 
@@ -152,7 +152,7 @@ public class ServiceProcessusTests
     // ── AvancerATacheSuivanteAsync : recherche du signal ─────────────────────
 
     [Fact]
-    public async Task Avancer_echoue_si_aucun_processus()
+    public async Task AvancerEchoueSiAucunProcessusAsync()
     {
         Instances(correlation);
 
@@ -162,7 +162,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_ignore_les_correlations_qui_ne_sont_pas_de_tete()
+    public async Task AvancerIgnoreLesCorrelationsQuiNeSontPasDeTeteAsync()
     {
         var correlationSous = new Correlation(fixture.Create<string>(), TypeSous);
 
@@ -172,7 +172,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_echoue_si_aucun_signal_attendu()
+    public async Task AvancerEchoueSiAucunSignalAttenduAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, fixture.Create<string>());
@@ -183,7 +183,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_traite_des_signaux_null_comme_une_liste_vide()
+    public async Task AvancerTraiteSignauxNullCommeListeVideAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         agent.ObtenirSignauxEnAttenteAsync(idTete).Returns(Task.FromResult<IEnumerable<string>>(null!));
@@ -193,7 +193,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_n_emet_rien_si_plusieurs_instances_attendent_le_signal()
+    public async Task AvancerSansEmissionSiPlusieursInstancesAttendentLeSignalAsync()
     {
         var correlation2 = AutreCorrelation();
         var idAutre = fixture.Create<long>();
@@ -208,7 +208,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_n_interroge_que_l_instance_la_plus_basse_de_chaque_chaine()
+    public async Task AvancerInterrogeSeulementInstanceLaPlusBasseDeChaqueChaineAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
         Signaux(idSous, signal);
@@ -223,7 +223,7 @@ public class ServiceProcessusTests
     // ── AvancerATacheSuivanteAsync : émission et tâche suivante ──────────────
 
     [Fact]
-    public async Task Avancer_emet_le_signal_et_retourne_la_tache_suivante()
+    public async Task AvancerEmetLeSignalEtRetourneLaTacheSuivanteAsync()
     {
         var idTache = fixture.Create<long>();
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
@@ -238,7 +238,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_attend_que_le_moteur_cree_la_tache_suivante()
+    public async Task AvancerAttendQueLeMoteurCreeLaTacheSuivanteAsync()
     {
         var idTache = fixture.Create<long>();
         Instances(correlation, Instance(idTete, TypeTete));
@@ -256,7 +256,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_trouve_la_tache_dans_un_sous_processus_demarre_par_le_signal()
+    public async Task AvancerTrouveLaTacheDansUnSousProcessusDemarreParLeSignalAsync()
     {
         var idTache = fixture.Create<long>();
         agent.ObtenirInstancesProcessusAsync(correlation.IdCorrelation).Returns(
@@ -269,7 +269,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_ne_cherche_la_tache_que_dans_la_correlation_signalee()
+    public async Task AvancerChercheLaTacheSeulementDansLaCorrelationSignaleeAsync()
     {
         var correlation2 = AutreCorrelation();
         var idAutre = fixture.Create<long>();
@@ -287,7 +287,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_echoue_si_la_tache_suivante_n_apparait_pas()
+    public async Task AvancerEchoueSiLaTacheSuivanteEstIntrouvableAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, signal);
@@ -301,7 +301,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task Avancer_echoue_si_plusieurs_taches_portent_le_code()
+    public async Task AvancerEchoueSiPlusieursTachesPortentLeCodeAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
         Signaux(idSous, signal);
@@ -315,7 +315,7 @@ public class ServiceProcessusTests
 
 #pragma warning disable CS0618
     [Fact]
-    public async Task SiEnAttente_retourne_le_parent_de_l_instance_signalee()
+    public async Task TerminerSiEnAttenteRetourneLeParentDeInstanceSignaleeAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
         Signaux(idSous, signal);
@@ -324,7 +324,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task SiEnAttente_retourne_l_instance_elle_meme_si_elle_est_racine()
+    public async Task TerminerSiEnAttenteRetourneInstanceElleMemeSiRacineAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, signal);
@@ -333,7 +333,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task SiEnAttente_retourne_null_si_aucun_processus()
+    public async Task TerminerSiEnAttenteRetourneNullSiAucunProcessusAsync()
     {
         Instances(correlation);
 
@@ -341,7 +341,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task SiEnAttente_retourne_null_sans_emettre_si_aucun_signal_attendu()
+    public async Task TerminerSiEnAttenteRetourneNullSansEmettreSiAucunSignalAttenduAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, fixture.Create<string>());
@@ -354,7 +354,7 @@ public class ServiceProcessusTests
     // ── TerminerTacheEnAttenteAsync ──────────────────────────────────────────
 
     [Fact]
-    public async Task EnAttente_emet_le_signal_sans_contenu()
+    public async Task TerminerEnAttenteEmetLeSignalSansContenuAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, signal);
@@ -365,7 +365,7 @@ public class ServiceProcessusTests
     }
 
     [Fact]
-    public async Task EnAttente_echoue_si_le_signal_n_est_pas_attendu()
+    public async Task TerminerEnAttenteEchoueSiSignalNonAttenduAsync()
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, fixture.Create<string>());
