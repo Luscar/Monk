@@ -1,6 +1,10 @@
 using AT99.Framework.Infra.Processus;
 using AT99.Framework.Infra.Processus.Modeles;
 using AT99.Framework.Infra.Processus.Modeles.Bpm;
+using AutoFixture;
+using AutoFixture.AutoNSubstitute;
+using Autofac.Features.Indexed;
+using FluentAssertions;
 using NSubstitute;
 using Xunit;
 
@@ -30,27 +34,45 @@ public class ServiceProcessusTests
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    private const string Signal = "SIGNAL_OK";
-    private const string CodeTache = "TACHE_SUIVANTE";
-    private sealed record Contenu(string Valeur);
+    public sealed record Contenu(string Valeur);
 
-    private readonly IAgentServiceBpm agent = Substitute.For<IAgentServiceBpm>();
-    private readonly IAgentServiceTacheBpm agentTache = Substitute.For<IAgentServiceTacheBpm>();
-    private readonly Correlation correlation = new("CORR-1", TypeTete);
+    private readonly IFixture fixture = new Fixture().Customize(new AutoNSubstituteCustomization());
+
+    private readonly IAgentServiceBpm agent;
+    private readonly IAgentServiceTacheBpm agentTache;
     private readonly ServiceProcessusTestable service;
+
+    // Données anonymes générées par AutoFixture.
+    private readonly Correlation correlation;
+    private readonly Contenu contenu;
+    private readonly string signal;
+    private readonly string codeTache;
+    private readonly long idTete;
+    private readonly long idSous;
 
     public ServiceProcessusTests()
     {
-        var modes = new[] { TypeTete, TypeSous, TypeAutreTete }.Select(t => t.ModeTraitement).Distinct().ToList();
-        service = new ServiceProcessusTestable(
-            modes.ToDictionary(m => m, _ => agent),
-            modes.ToDictionary(m => m, _ => agentTache));
+        agent = fixture.Freeze<IAgentServiceBpm>();
+        agentTache = fixture.Freeze<IAgentServiceTacheBpm>();
+
+        // Le même agent répond pour tous les modes de traitement.
+        fixture.Freeze<IIndex<ModeTraitement, IAgentServiceBpm>>()[Arg.Any<ModeTraitement>()].Returns(agent);
+        fixture.Freeze<IIndex<ModeTraitement, IAgentServiceTacheBpm>>()[Arg.Any<ModeTraitement>()].Returns(agentTache);
+
+        service = fixture.Create<ServiceProcessusTestable>();
+
+        correlation = new Correlation(fixture.Create<string>(), TypeTete);
+        contenu = fixture.Create<Contenu>();
+        signal = fixture.Create<string>();
+        codeTache = fixture.Create<string>();
+        idTete = fixture.Create<long>();
+        idSous = fixture.Create<long>();
     }
 
     /// <summary>Supprime l'attente entre les tentatives et simule la recherche de tâche.</summary>
-    private sealed class ServiceProcessusTestable(
-        IReadOnlyDictionary<ModeTraitement, IAgentServiceBpm> agents,
-        IReadOnlyDictionary<ModeTraitement, IAgentServiceTacheBpm> agentsTache)
+    public sealed class ServiceProcessusTestable(
+        IIndex<ModeTraitement, IAgentServiceBpm> agents,
+        IIndex<ModeTraitement, IAgentServiceTacheBpm> agentsTache)
         : ServiceProcessus(agents, agentsTache)
     {
         public Func<long, TacheBpm?> TacheDe { get; set; } = _ => null;
@@ -71,34 +93,38 @@ public class ServiceProcessusTests
     private static Task<IEnumerable<ProcessusBpm>> Liste(params ProcessusBpm[] instances) =>
         Task.FromResult<IEnumerable<ProcessusBpm>>(instances);
 
-    private void Instances(string idCorrelation, params ProcessusBpm[] instances) =>
-        agent.ObtenirInstancesProcessusAsync(idCorrelation).Returns(Liste(instances));
+    private void Instances(Correlation c, params ProcessusBpm[] instances) =>
+        agent.ObtenirInstancesProcessusAsync(c.IdCorrelation).Returns(Liste(instances));
 
     private void Signaux(long idInstance, params string[] signaux) =>
         agent.ObtenirSignauxEnAttenteAsync(idInstance).Returns(Task.FromResult<IEnumerable<string>>(signaux));
 
+    private Correlation AutreCorrelation() => new(fixture.Create<string>(), TypeAutreTete);
+
     /// <summary>EmettreSignalAsync est générique : on vérifie par nom de méthode, quel que soit T.</summary>
     private void VerifierAucuneEmission() =>
-        Assert.DoesNotContain(agent.ReceivedCalls(),
-            c => c.GetMethodInfo().Name == nameof(IAgentServiceBpm.EmettreSignalAsync));
+        agent.ReceivedCalls()
+            .Should().NotContain(c => c.GetMethodInfo().Name == nameof(IAgentServiceBpm.EmettreSignalAsync));
 
-    private static async Task<RaisonEchecProcessus> RaisonAsync(Func<Task> action) =>
-        (await Assert.ThrowsAsync<ProcessusBpmException>(action)).Raison;
+    private Func<Task<long>> Avancer(params Correlation[] correlations) =>
+        () => service.AvancerATacheSuivanteAsync(correlations, [signal], contenu, codeTache);
 
     // ── EstProcessusEnCoursAsync ─────────────────────────────────────────────
 
     [Fact]
     public async Task EstProcessusEnCours_vrai_si_une_instance_existe()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Assert.True(await service.EstProcessusEnCoursAsync(correlation));
+        Instances(correlation, Instance(idTete, TypeTete));
+
+        (await service.EstProcessusEnCoursAsync(correlation)).Should().BeTrue();
     }
 
     [Fact]
     public async Task EstProcessusEnCours_faux_si_aucune_instance()
     {
-        Instances("CORR-1");
-        Assert.False(await service.EstProcessusEnCoursAsync(correlation));
+        Instances(correlation);
+
+        (await service.EstProcessusEnCoursAsync(correlation)).Should().BeFalse();
     }
 
     // ── DemarrerProcessusAsync / TerminerTacheAsync ──────────────────────────
@@ -106,20 +132,21 @@ public class ServiceProcessusTests
     [Fact]
     public async Task DemarrerProcessus_cree_le_processus_avec_la_correlation()
     {
-        agent.CreerSansDateProductionAsync(TypeTete.Code, Arg.Any<Dictionary<string, object>>(), "CORR-1")
-            .Returns(Task.FromResult(42L));
+        var idCree = fixture.Create<long>();
+        agent.CreerSansDateProductionAsync(TypeTete.Code, Arg.Any<Dictionary<string, object>>(), correlation.IdCorrelation)
+            .Returns(Task.FromResult(idCree));
 
-        Assert.Equal(42, await service.DemarrerProcessusAsync(correlation, new ProcessusAT()));
+        (await service.DemarrerProcessusAsync(correlation, new ProcessusAT())).Should().Be(idCree);
     }
 
     [Fact]
     public async Task TerminerTache_delegue_a_l_agent_de_tache()
     {
-        var contenu = new Contenu("x");
+        var numeroTache = fixture.Create<long>();
 
-        await service.TerminerTacheAsync(99, contenu, TypeTete.ModeTraitement);
+        await service.TerminerTacheAsync(numeroTache, contenu, TypeTete.ModeTraitement);
 
-        await agentTache.Received(1).TerminerAsync(99, contenu);
+        await agentTache.Received(1).TerminerAsync(numeroTache, contenu);
     }
 
     // ── AvancerATacheSuivanteAsync : recherche du signal ─────────────────────
@@ -127,78 +154,70 @@ public class ServiceProcessusTests
     [Fact]
     public async Task Avancer_echoue_si_aucun_processus()
     {
-        Instances("CORR-1");
+        Instances(correlation);
 
-        var raison = await RaisonAsync(() =>
-            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
-
-        Assert.Equal(RaisonEchecProcessus.AucunProcessus, raison);
+        await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.AucunProcessus);
         VerifierAucuneEmission();
     }
 
     [Fact]
     public async Task Avancer_ignore_les_correlations_qui_ne_sont_pas_de_tete()
     {
-        var correlationSous = new Correlation("CORR-SOUS", TypeSous);
+        var correlationSous = new Correlation(fixture.Create<string>(), TypeSous);
 
-        var raison = await RaisonAsync(() =>
-            service.AvancerATacheSuivanteAsync([correlationSous], [Signal], new Contenu("x"), CodeTache));
-
-        Assert.Equal(RaisonEchecProcessus.AucunProcessus, raison);
+        await Avancer(correlationSous).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.AucunProcessus);
         await agent.DidNotReceiveWithAnyArgs().ObtenirInstancesProcessusAsync(default!);
     }
 
     [Fact]
     public async Task Avancer_echoue_si_aucun_signal_attendu()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, "AUTRE_SIGNAL");
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, fixture.Create<string>());
 
-        var raison = await RaisonAsync(() =>
-            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
-
-        Assert.Equal(RaisonEchecProcessus.AucunSignalEnAttente, raison);
+        await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.AucunSignalEnAttente);
         VerifierAucuneEmission();
     }
 
     [Fact]
     public async Task Avancer_traite_des_signaux_null_comme_une_liste_vide()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        agent.ObtenirSignauxEnAttenteAsync(10).Returns(Task.FromResult<IEnumerable<string>>(null!));
+        Instances(correlation, Instance(idTete, TypeTete));
+        agent.ObtenirSignauxEnAttenteAsync(idTete).Returns(Task.FromResult<IEnumerable<string>>(null!));
 
-        var raison = await RaisonAsync(() =>
-            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
-
-        Assert.Equal(RaisonEchecProcessus.AucunSignalEnAttente, raison);
+        await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.AucunSignalEnAttente);
     }
 
     [Fact]
     public async Task Avancer_n_emet_rien_si_plusieurs_instances_attendent_le_signal()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Instances("CORR-2", Instance(20, TypeAutreTete));
-        Signaux(10, Signal);
-        Signaux(20, Signal);
+        var correlation2 = AutreCorrelation();
+        var idAutre = fixture.Create<long>();
+        Instances(correlation, Instance(idTete, TypeTete));
+        Instances(correlation2, Instance(idAutre, TypeAutreTete));
+        Signaux(idTete, signal);
+        Signaux(idAutre, signal);
 
-        var raison = await RaisonAsync(() => service.AvancerATacheSuivanteAsync(
-            [correlation, new Correlation("CORR-2", TypeAutreTete)], [Signal], new Contenu("x"), CodeTache));
-
-        Assert.Equal(RaisonEchecProcessus.SignalAmbigu, raison);
+        await Avancer(correlation, correlation2).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.SignalAmbigu);
         VerifierAucuneEmission();
     }
 
     [Fact]
     public async Task Avancer_n_interroge_que_l_instance_la_plus_basse_de_chaque_chaine()
     {
-        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
-        Signaux(11, Signal);
-        service.TacheDe = id => id == 10 ? Tache(500, CodeTache) : null;
+        Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
+        Signaux(idSous, signal);
+        service.TacheDe = id => id == idTete ? Tache(fixture.Create<long>(), codeTache) : null;
 
-        await service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache);
+        await Avancer(correlation)();
 
-        await agent.DidNotReceive().ObtenirSignauxEnAttenteAsync(10);
-        await agent.Received(1).ObtenirSignauxEnAttenteAsync(11);
+        await agent.DidNotReceive().ObtenirSignauxEnAttenteAsync(idTete);
+        await agent.Received(1).ObtenirSignauxEnAttenteAsync(idSous);
     }
 
     // ── AvancerATacheSuivanteAsync : émission et tâche suivante ──────────────
@@ -206,89 +225,90 @@ public class ServiceProcessusTests
     [Fact]
     public async Task Avancer_emet_le_signal_et_retourne_la_tache_suivante()
     {
-        var contenu = new Contenu("x");
-        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
-        Signaux(11, "AUTRE_SIGNAL", Signal);
-        service.TacheDe = id => id == 10 ? Tache(500, CodeTache) : null;
+        var idTache = fixture.Create<long>();
+        Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
+        Signaux(idSous, fixture.Create<string>(), signal);
+        service.TacheDe = id => id == idTete ? Tache(idTache, codeTache) : null;
 
-        var idTache = await service.AvancerATacheSuivanteAsync([correlation], ["X", Signal], contenu, CodeTache);
+        var resultat = await service.AvancerATacheSuivanteAsync(
+            [correlation], [fixture.Create<string>(), signal], contenu, codeTache);
 
-        Assert.Equal(500, idTache);
-        await agent.Received(1).EmettreSignalAsync(11, Signal, contenu);
+        resultat.Should().Be(idTache);
+        await agent.Received(1).EmettreSignalAsync(idSous, signal, contenu);
     }
 
     [Fact]
     public async Task Avancer_attend_que_le_moteur_cree_la_tache_suivante()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, Signal);
+        var idTache = fixture.Create<long>();
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, signal);
         var appels = 0;
         // 1re lecture : ancienne tâche encore présente ; 2e : tâche suivante créée.
-        service.TacheDe = _ => ++appels == 1 ? Tache(400, "ANCIENNE_TACHE") : Tache(500, CodeTache);
+        service.TacheDe = _ => ++appels == 1
+            ? Tache(fixture.Create<long>(), fixture.Create<string>())
+            : Tache(idTache, codeTache);
 
-        var idTache = await service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache);
+        var resultat = await Avancer(correlation)();
 
-        Assert.Equal(500, idTache);
-        Assert.Equal(2, appels);
+        resultat.Should().Be(idTache);
+        appels.Should().Be(2);
     }
 
     [Fact]
     public async Task Avancer_trouve_la_tache_dans_un_sous_processus_demarre_par_le_signal()
     {
-        agent.ObtenirInstancesProcessusAsync("CORR-1").Returns(
-            Liste(Instance(10, TypeTete)),                                    // recherche du signal
-            Liste(Instance(10, TypeTete), Instance(12, TypeSous, parent: 10))); // après le signal
-        Signaux(10, Signal);
-        service.TacheDe = id => id == 12 ? Tache(600, CodeTache) : null;
+        var idTache = fixture.Create<long>();
+        agent.ObtenirInstancesProcessusAsync(correlation.IdCorrelation).Returns(
+            Liste(Instance(idTete, TypeTete)),                                         // recherche du signal
+            Liste(Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete))); // après le signal
+        Signaux(idTete, signal);
+        service.TacheDe = id => id == idSous ? Tache(idTache, codeTache) : null;
 
-        var idTache = await service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache);
-
-        Assert.Equal(600, idTache);
+        (await Avancer(correlation)()).Should().Be(idTache);
     }
 
     [Fact]
     public async Task Avancer_ne_cherche_la_tache_que_dans_la_correlation_signalee()
     {
-        var correlation2 = new Correlation("CORR-2", TypeAutreTete);
-        Instances("CORR-1", Instance(10, TypeTete));
-        Instances("CORR-2", Instance(20, TypeAutreTete));
-        Signaux(10, Signal);
-        service.TacheDe = id => id == 10 ? Tache(500, CodeTache) : Tache(900, CodeTache);
+        var correlation2 = AutreCorrelation();
+        var idAutre = fixture.Create<long>();
+        var idTache = fixture.Create<long>();
+        Instances(correlation, Instance(idTete, TypeTete));
+        Instances(correlation2, Instance(idAutre, TypeAutreTete));
+        Signaux(idTete, signal);
+        service.TacheDe = id => id == idTete ? Tache(idTache, codeTache) : Tache(fixture.Create<long>(), codeTache);
 
-        var idTache = await service.AvancerATacheSuivanteAsync(
-            [correlation, correlation2], [Signal], new Contenu("x"), CodeTache);
+        var resultat = await Avancer(correlation, correlation2)();
 
-        Assert.Equal(500, idTache);
-        Assert.DoesNotContain(20L, service.InstancesInterrogees);
-        await agent.Received(1).ObtenirInstancesProcessusAsync("CORR-2"); // recherche du signal seulement
+        resultat.Should().Be(idTache);
+        service.InstancesInterrogees.Should().NotContain(idAutre);
+        await agent.Received(1).ObtenirInstancesProcessusAsync(correlation2.IdCorrelation); // recherche du signal seulement
     }
 
     [Fact]
     public async Task Avancer_echoue_si_la_tache_suivante_n_apparait_pas()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, Signal);
-        service.TacheDe = _ => Tache(400, "ANCIENNE_TACHE");
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, signal);
+        service.TacheDe = _ => Tache(fixture.Create<long>(), fixture.Create<string>());
 
-        var raison = await RaisonAsync(() =>
-            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
+        await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.TacheSuivanteIntrouvable);
 
-        Assert.Equal(RaisonEchecProcessus.TacheSuivanteIntrouvable, raison);
         // Le signal est déjà émis : le front doit relire la tâche, pas relancer l'action.
-        await agent.Received(1).EmettreSignalAsync(10, Signal, Arg.Any<Contenu>());
+        await agent.Received(1).EmettreSignalAsync(idTete, signal, Arg.Any<Contenu>());
     }
 
     [Fact]
     public async Task Avancer_echoue_si_plusieurs_taches_portent_le_code()
     {
-        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
-        Signaux(11, Signal);
-        service.TacheDe = id => Tache(id * 100, CodeTache);
+        Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
+        Signaux(idSous, signal);
+        service.TacheDe = id => Tache(id, codeTache);
 
-        var raison = await RaisonAsync(() =>
-            service.AvancerATacheSuivanteAsync([correlation], [Signal], new Contenu("x"), CodeTache));
-
-        Assert.Equal(RaisonEchecProcessus.TacheSuivanteAmbigue, raison);
+        await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.TacheSuivanteAmbigue);
     }
 
     // ── TerminerTacheSiEnAttenteAsync (obsolète) ─────────────────────────────
@@ -297,36 +317,36 @@ public class ServiceProcessusTests
     [Fact]
     public async Task SiEnAttente_retourne_le_parent_de_l_instance_signalee()
     {
-        Instances("CORR-1", Instance(10, TypeTete), Instance(11, TypeSous, parent: 10));
-        Signaux(11, Signal);
+        Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
+        Signaux(idSous, signal);
 
-        Assert.Equal(10, await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+        (await service.TerminerTacheSiEnAttenteAsync([correlation], [signal], contenu)).Should().Be(idTete);
     }
 
     [Fact]
     public async Task SiEnAttente_retourne_l_instance_elle_meme_si_elle_est_racine()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, Signal);
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, signal);
 
-        Assert.Equal(10, await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+        (await service.TerminerTacheSiEnAttenteAsync([correlation], [signal], contenu)).Should().Be(idTete);
     }
 
     [Fact]
     public async Task SiEnAttente_retourne_null_si_aucun_processus()
     {
-        Instances("CORR-1");
+        Instances(correlation);
 
-        Assert.Null(await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+        (await service.TerminerTacheSiEnAttenteAsync([correlation], [signal], contenu)).Should().BeNull();
     }
 
     [Fact]
     public async Task SiEnAttente_retourne_null_sans_emettre_si_aucun_signal_attendu()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, "AUTRE_SIGNAL");
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, fixture.Create<string>());
 
-        Assert.Null(await service.TerminerTacheSiEnAttenteAsync([correlation], [Signal], new Contenu("x")));
+        (await service.TerminerTacheSiEnAttenteAsync([correlation], [signal], contenu)).Should().BeNull();
         VerifierAucuneEmission();
     }
 #pragma warning restore CS0618
@@ -336,22 +356,23 @@ public class ServiceProcessusTests
     [Fact]
     public async Task EnAttente_emet_le_signal_sans_contenu()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, Signal);
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, signal);
 
-        await service.TerminerTacheEnAttenteAsync([correlation], Signal);
+        await service.TerminerTacheEnAttenteAsync([correlation], signal);
 
-        await agent.Received(1).EmettreSignalAsync<object?>(10, Signal, null);
+        await agent.Received(1).EmettreSignalAsync<object?>(idTete, signal, null);
     }
 
     [Fact]
     public async Task EnAttente_echoue_si_le_signal_n_est_pas_attendu()
     {
-        Instances("CORR-1", Instance(10, TypeTete));
-        Signaux(10, "AUTRE_SIGNAL");
+        Instances(correlation, Instance(idTete, TypeTete));
+        Signaux(idTete, fixture.Create<string>());
 
-        var raison = await RaisonAsync(() => service.TerminerTacheEnAttenteAsync([correlation], Signal));
+        var action = () => service.TerminerTacheEnAttenteAsync([correlation], signal);
 
-        Assert.Equal(RaisonEchecProcessus.AucunSignalEnAttente, raison);
+        await action.Should().ThrowAsync<ProcessusBpmException>()
+            .Where(e => e.Raison == RaisonEchecProcessus.AucunSignalEnAttente);
     }
 }
