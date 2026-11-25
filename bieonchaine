@@ -1,0 +1,97 @@
+using AT99.Framework.Infra.Processus.Modeles.Bpm;
+
+namespace AT99.Framework.Infra.Processus;
+
+/// <summary>
+/// Lignée d'instances, du processus de tête (<see cref="PlusHaut"/>)
+/// jusqu'à l'instance la plus basse, la dernière-née (<see cref="PlusBas"/>).
+/// </summary>
+public sealed class ChaineProcessus
+{
+    public ChaineProcessus(IReadOnlyList<ProcessusBpm> instances)
+    {
+        if (instances.Count == 0)
+            throw new ArgumentException("Une chaîne contient au moins une instance.", nameof(instances));
+
+        Instances = instances;
+    }
+
+    /// <summary>Instances ordonnées du haut (tête) vers le bas (dernière-née).</summary>
+    public IReadOnlyList<ProcessusBpm> Instances { get; }
+
+    public ProcessusBpm PlusHaut => Instances[0];
+
+    public ProcessusBpm PlusBas => Instances[^1];
+
+    public override string ToString() =>
+        string.Join(" > ", Instances.Select(i => $"{i.IdProcessus}({i.IdInstanceProcessus})"));
+}
+
+public static class ExtensionsChainesProcessus
+{
+    /// <summary>
+    /// Regroupe des instances en chaînes parent → enfant.
+    /// Une chaîne par instance qui n'a aucun enfant dans la liste (une feuille).
+    /// </summary>
+    /// <remarks>
+    /// <list type="bullet">
+    /// <item>Un parent absent de la liste est ignoré : l'instance devient le haut de sa chaîne.</item>
+    /// <item>Si une instance a plusieurs enfants, chaque branche donne sa propre chaîne ;
+    /// les ancêtres communs apparaissent dans chacune.</item>
+    /// <item>Les doublons (même IdInstanceProcessus) sont fusionnés.</item>
+    /// </list>
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">Si les liens parent forment un cycle.</exception>
+    public static IReadOnlyList<ChaineProcessus> EnChaines(this IEnumerable<ProcessusBpm> instances)
+    {
+        ArgumentNullException.ThrowIfNull(instances);
+
+        var parId = new Dictionary<long, ProcessusBpm>();
+        foreach (var instance in instances)
+            parId.TryAdd(instance.IdInstanceProcessus, instance);
+
+        var aDesEnfants = parId.Values
+            .Where(i => i.IdInstanceProcessusParent is long parent && parId.ContainsKey(parent))
+            .Select(i => i.IdInstanceProcessusParent!.Value)
+            .ToHashSet();
+
+        var chaines = parId.Values
+            .Where(i => !aDesEnfants.Contains(i.IdInstanceProcessus))
+            .Select(feuille => RemonterJusquEnHaut(feuille, parId))
+            .OrderBy(c => c.PlusHaut.IdInstanceProcessus)
+            .ThenBy(c => c.PlusBas.IdInstanceProcessus)
+            .ToList();
+
+        // Un cycle « fermé » (A → B → A, sans feuille) n'est atteint par aucune chaîne.
+        var couvertes = chaines.SelectMany(c => c.Instances).Select(i => i.IdInstanceProcessus).ToHashSet();
+        var orphelines = parId.Keys.Where(id => !couvertes.Contains(id)).ToList();
+        if (orphelines.Count > 0)
+            throw new InvalidOperationException(
+                $"Cycle détecté dans les liens parent entre les instances {string.Join(", ", orphelines)}.");
+
+        return chaines;
+    }
+
+    private static ChaineProcessus RemonterJusquEnHaut(ProcessusBpm feuille, Dictionary<long, ProcessusBpm> parId)
+    {
+        var lignee = new List<ProcessusBpm>();
+        var visitees = new HashSet<long>();
+
+        for (var courante = feuille; courante is not null; courante = Parent(courante, parId))
+        {
+            if (!visitees.Add(courante.IdInstanceProcessus))
+                throw new InvalidOperationException(
+                    $"Cycle détecté dans les liens parent à partir de l'instance {feuille.IdInstanceProcessus}.");
+
+            lignee.Add(courante);
+        }
+
+        lignee.Reverse(); // du haut vers le bas
+        return new ChaineProcessus(lignee);
+    }
+
+    private static ProcessusBpm? Parent(ProcessusBpm instance, Dictionary<long, ProcessusBpm> parId) =>
+        instance.IdInstanceProcessusParent is long idParent && parId.TryGetValue(idParent, out var parent)
+            ? parent
+            : null;
+}
