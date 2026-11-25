@@ -69,23 +69,14 @@ public class ServiceProcessusTests
         idSous = fixture.Create<long>();
     }
 
-    /// <summary>Supprime l'attente entre les tentatives et simule la recherche de tâche.</summary>
+    /// <summary>Supprime l'attente entre les tentatives de recherche de la tâche suivante.</summary>
     public sealed class ServiceProcessusTestable(
         IIndex<ModeTraitement, IAgentServiceBpm> agents,
         IIndex<ModeTraitement, IAgentServiceTacheBpm> agentsTache)
         : ServiceProcessus(agents, agentsTache)
     {
-        public Func<long, TacheBpm?> TacheDe { get; set; } = _ => null;
-        public List<long> InstancesInterrogees { get; } = [];
-
         protected override IReadOnlyList<TimeSpan> DelaisAttenteTache { get; } =
             [TimeSpan.Zero, TimeSpan.Zero, TimeSpan.Zero];
-
-        protected override Task<TacheBpm?> ObtenirTacheAPartirProcessusAsync(ModeTraitement mode, long numeroProcessus)
-        {
-            InstancesInterrogees.Add(numeroProcessus);
-            return Task.FromResult(TacheDe(numeroProcessus));
-        }
     }
 
     // ── Utilitaires ──────────────────────────────────────────────────────────
@@ -98,6 +89,11 @@ public class ServiceProcessusTests
 
     private void Signaux(long idInstance, params string[] signaux) =>
         agent.ObtenirSignauxEnAttenteAsync(idInstance).Returns(Task.FromResult<IEnumerable<string>>(signaux));
+
+    /// <summary>Configure la tâche active retournée par l'agent pour chaque instance.</summary>
+    private void Taches(Func<long, TacheBpm?> tacheDe) =>
+        agent.ObtenirTacheAPartirProcessusAsync(Arg.Any<long>())
+            .Returns(appel => Task.FromResult(tacheDe(appel.Arg<long>())));
 
     private Correlation AutreCorrelation() => new(fixture.Create<string>(), TypeAutreTete);
 
@@ -212,7 +208,7 @@ public class ServiceProcessusTests
     {
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
         Signaux(idSous, signal);
-        service.TacheDe = id => id == idTete ? Tache(fixture.Create<long>(), codeTache) : null;
+        Taches(id => id == idTete ? Tache(fixture.Create<long>(), codeTache) : null);
 
         await Avancer(correlation)();
 
@@ -228,7 +224,7 @@ public class ServiceProcessusTests
         var idTache = fixture.Create<long>();
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
         Signaux(idSous, fixture.Create<string>(), signal);
-        service.TacheDe = id => id == idTete ? Tache(idTache, codeTache) : null;
+        Taches(id => id == idTete ? Tache(idTache, codeTache) : null);
 
         var resultat = await service.AvancerATacheSuivanteAsync(
             [correlation], [fixture.Create<string>(), signal], contenu, codeTache);
@@ -245,9 +241,9 @@ public class ServiceProcessusTests
         Signaux(idTete, signal);
         var appels = 0;
         // 1re lecture : ancienne tâche encore présente ; 2e : tâche suivante créée.
-        service.TacheDe = _ => ++appels == 1
+        Taches(_ => ++appels == 1
             ? Tache(fixture.Create<long>(), fixture.Create<string>())
-            : Tache(idTache, codeTache);
+            : Tache(idTache, codeTache));
 
         var resultat = await Avancer(correlation)();
 
@@ -263,7 +259,7 @@ public class ServiceProcessusTests
             Liste(Instance(idTete, TypeTete)),                                         // recherche du signal
             Liste(Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete))); // après le signal
         Signaux(idTete, signal);
-        service.TacheDe = id => id == idSous ? Tache(idTache, codeTache) : null;
+        Taches(id => id == idSous ? Tache(idTache, codeTache) : null);
 
         (await Avancer(correlation)()).Should().Be(idTache);
     }
@@ -277,12 +273,12 @@ public class ServiceProcessusTests
         Instances(correlation, Instance(idTete, TypeTete));
         Instances(correlation2, Instance(idAutre, TypeAutreTete));
         Signaux(idTete, signal);
-        service.TacheDe = id => id == idTete ? Tache(idTache, codeTache) : Tache(fixture.Create<long>(), codeTache);
+        Taches(id => id == idTete ? Tache(idTache, codeTache) : Tache(fixture.Create<long>(), codeTache));
 
         var resultat = await Avancer(correlation, correlation2)();
 
         resultat.Should().Be(idTache);
-        service.InstancesInterrogees.Should().NotContain(idAutre);
+        await agent.DidNotReceive().ObtenirTacheAPartirProcessusAsync(idAutre);
         await agent.Received(1).ObtenirInstancesProcessusAsync(correlation2.IdCorrelation); // recherche du signal seulement
     }
 
@@ -291,7 +287,7 @@ public class ServiceProcessusTests
     {
         Instances(correlation, Instance(idTete, TypeTete));
         Signaux(idTete, signal);
-        service.TacheDe = _ => Tache(fixture.Create<long>(), fixture.Create<string>());
+        Taches(_ => Tache(fixture.Create<long>(), fixture.Create<string>()));
 
         await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
             .Where(e => e.Raison == RaisonEchecProcessus.TacheSuivanteIntrouvable);
@@ -305,7 +301,7 @@ public class ServiceProcessusTests
     {
         Instances(correlation, Instance(idTete, TypeTete), Instance(idSous, TypeSous, parent: idTete));
         Signaux(idSous, signal);
-        service.TacheDe = id => Tache(id, codeTache);
+        Taches(id => Tache(id, codeTache));
 
         await Avancer(correlation).Should().ThrowAsync<ProcessusBpmException>()
             .Where(e => e.Raison == RaisonEchecProcessus.TacheSuivanteAmbigue);
